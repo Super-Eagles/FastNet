@@ -1,0 +1,1267 @@
+﻿/**
+ * @file EventPoller.cpp
+ * @brief FastNet缃戠粶搴撲簨浠惰疆璇㈠櫒浠? * @author slob
+ * @version 1.4.0
+ * @date 2025-12-13
+ *
+ * 瀹炵幇楂樻€ц兘浜嬩欢杞鏈哄埗: Windows IOCP + Linux epoll
+ * 浼樺寲: 浣跨敤璇诲啓閿佹彁鍗囧苟鍙戞€ц兘
+ *
+ * 娉ㄦ剰浜嬮」:
+ * 1. std::atomic 鍙橀噺蹇呴』鍦ㄥ０鏄庢椂鎴栧垪琛ㄤ腑鏄惧紡
+ *    鍚﹀垯榛樿鏋勯€犵殑 atomic<T> 鐘舵€佹槸鏈畾涔夌殑(indeterminate)
+ * 2. 鎵€鏈夋秹鍙婂绾跨▼璁块棶鐨勫彉閲忛兘浣跨敤閫傚綋鐨勫唴瀛樺簭(memory_order)
+ * 3. Windows IOCP ?Linux epoll 鐨勫疄鐜扮粏鑺備笉鍚岋紝娉ㄦ剰鍖哄垎閰嶅鐞? */
+#include "EventPoller.h"
+#include "Logger.h"
+#include <algorithm>
+#include <cstring>
+#include <shared_mutex>
+#include <deque>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <chrono>
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <windows.h>
+    #include <mswsock.h>
+#else
+    #include <sys/epoll.h>
+    #include <sys/eventfd.h>
+    #include <unistd.h>
+    #include <errno.h>
+#endif
+// 鎺ユ敹缂撳啿鍖洪粯璁ゅぇ灏忥紙8KB
+constexpr size_t DEFAULT_RECV_BUFFER_SIZE = 8192;
+// 浜嬩欢杞鐨勬渶澶ф壒閲忔暟
+constexpr size_t MAX_POLL_BATCH_SIZE = 64;
+// 榛樿鏈€澶т簨浠舵暟
+constexpr size_t DEFAULT_MAX_EVENTS = 10000;
+// Linux寰呭鐞嗕簨浠堕槦鍒楁渶澶ф暟
+constexpr size_t MAX_PENDING_EVENTS = 1000;
+// Windows寰呭垹闄ら槦鍒楅槇
+constexpr size_t PENDING_DELETE_THRESHOLD = 100;
+// Windows娓呯悊绛夊緟鏃堕棿锛堟绉掞級
+constexpr int WINDOWS_CLEANUP_WAIT_MS = 50;
+// 鍞ら啋灏濊瘯娆℃暟锛堢‘淇濊瘉鍙潬鎬э級
+constexpr int WAKEUP_ATTEMPT_COUNT = 3;
+namespace FastNet {
+    #ifndef _WIN32
+    // 杈呭姪鍑芥暟锛氬皢 EventType 杞崲epoll events锛堜粎Linux
+    namespace {
+        inline uint32_t eventTypeToEpollEvents(EventType events) {
+            uint32_t epollEvents = 0;
+            if (hasEvent(events, EventType::Read)) {
+                epollEvents |= EPOLLIN;
+            }
+            if (hasEvent(events, EventType::Write)) {
+                epollEvents |= EPOLLOUT;
+            }
+            // EPOLLRDHUP锛氭娴嬪绔叧闂繛鎺ワ紙鍗婂叧闂級
+            epollEvents |= EPOLLRDHUP;
+            return epollEvents;
+        }
+    }
+    #endif
+    // 鍥炶皟淇℃伅缁撴瀯锛堢敤浜庢壒閲忓鐞嗕簨浠讹級
+    struct CallbackInfo {
+        socket_t fd;
+        EventType triggered;
+        EventCallback callback;  // 淇濊瘉瀛樺洖璋冿紝閬垮厤浜屾鏌?        void* data;              // 鏁版嵁鎸囬拡锛圠inux涓嬮€氬父涓簄ullptr
+        size_t len;              // 鏁版嵁闀垮害锛圠inux涓嬮€氬父
+    };
+    // Windows 鍥炶皟淇℃伅缁撴瀯
+    struct WindowsCallbackInfo {
+        socket_t fd;
+        EventType triggered;
+        EventCallback callback;  // 淇濊瘉瀛樺洖璋冿紝閬垮厤浜屾鏌?        bool needPostReceive;
+        bool shouldRemove;
+        void* data;              // 鎺ユ敹鍒扮殑鏁版嵁鎸囬拡
+        size_t len;              // 鎺ユ敹鍒扮殑鏁版嵁闀垮害
+    };
+    // 骞冲彴鐗瑰畾瀹炵幇
+    class EventPoller::Impl {
+    public:
+        // 娲诲姩 poll 璁℃暟锛堢敤shutdown 鍚屾
+        std::atomic<int> activePolls_{0};
+        #ifndef _WIN32
+        // Linux 浜嬩欢鎵瑰鐞嗙粨鏋勶紝鐢ㄤ簬鎵归噺瀛樺偍闇€瑕佸鐞嗙殑浜嬩欢
+        struct PendingEvent {
+            socket_t fd;
+            EventType triggered;
+            PendingEvent(socket_t f, EventType e) : fd(f), triggered(e) {}
+        };
+        // 寰呭鐞嗕簨浠堕槦鍒楋紙浣跨敤 deque 鎻愰珮鍒犻櫎鏁堢巼
+        std::deque<PendingEvent> pendingEvents_;
+        // 鎵归噺澶勭悊浜嬩欢鐨勬渶澶ф暟
+        size_t maxBatchSize_;
+        // 寰呭鐞嗕簨浠堕槦鍒楃殑鏈€澶ф暟閲忥紙闃叉鏃犻檺鍒跺闀?        size_t maxPendingEvents_;
+        #endif
+        Impl()
+            #ifdef _WIN32
+            : maxEvents_(DEFAULT_MAX_EVENTS), iocpHandle_(nullptr),
+              isCleaningUp_(false), isShutdown_(false)
+            #else
+            : maxEvents_(DEFAULT_MAX_EVENTS), maxBatchSize_(MAX_POLL_BATCH_SIZE), maxPendingEvents_(MAX_PENDING_EVENTS),
+              epollFd_(-1), eventFd_(-1), isCleaningUp_(false), isShutdown_(false)
+            #endif
+        {
+        }
+        ~Impl() {
+            cleanup();
+        }
+        bool initialize(size_t maxEvents) {
+            #ifdef _WIN32
+            // 妫€鏌ユ槸鍚﹀凡鎴栨鍦ㄦ竻鐞?            {
+                std::lock_guard<std::mutex> lock(wakeupMutex_);
+                if (iocpHandle_ != nullptr || isCleaningUp_.load(std::memory_order_acquire)) {
+                    return false;
+                }
+                // Windows鍒涘缓IOCP瀹屾垚绔彛
+                // ?涓弬鏁癗umberOfConcurrentThreads = 0 琛ㄧず鍏佽绯荤粺鑷姩璋冩暣
+                // 绯荤粺浼氭牴CPU 鏍稿績鏁拌嚜鍔ㄩ€夋嫨鍚堥€傜殑骞跺彂绾跨▼
+                iocpHandle_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
+                if (iocpHandle_ == nullptr) {
+                    LOG_ERROR("CreateIoCompletionPort failed, error: " + std::to_string(GetLastError()));
+                    return false;
+                }
+            }
+            maxEvents_ = maxEvents;
+            return true;
+            #else
+            // 妫€鏌ユ槸鍚﹀凡鎴栨鍦ㄦ竻鐞?            {
+                std::lock_guard<std::mutex> lock(wakeupMutex_);
+                if (epollFd_ >= 0 || isCleaningUp_.load(std::memory_order_acquire)) {
+                    return false;
+                }
+                // Linux鍒涘缓epoll瀹炵幇渚?                epollFd_ = epoll_create1(EPOLL_CLOEXEC);
+                if (epollFd_ < 0) {
+                    LOG_ERROR("epoll_create1 failed, errno: " + std::to_string(errno));
+                    return false;
+                }
+                // 鍒涘缓eventfd鐢ㄤ簬鍞ら啋
+                eventFd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+                if (eventFd_ < 0) {
+                    ::close(epollFd_);
+                    epollFd_ = -1;
+                    LOG_ERROR("eventfd failed, errno: " + std::to_string(errno));
+                    return false;
+                }
+                // 灏唀ventfd娣诲姞鍒癳poll
+                struct epoll_event ev;
+                ev.events = EPOLLIN;
+                ev.data.fd = eventFd_;
+                if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, eventFd_, &ev) < 0) {
+                    ::close(eventFd_);
+                    ::close(epollFd_);
+                    eventFd_ = -1;
+                    epollFd_ = -1;
+                    LOG_ERROR("epoll_ctl ADD eventfd failed, errno: " + std::to_string(errno));
+                    return false;
+                }
+                // 棰勫垎閰嶄簨浠剁紦鍐插尯
+                events_.resize(maxEvents_);
+                maxEvents_ = maxEvents;
+            }
+            return true;
+            #endif
+        }
+        void cleanup() noexcept {
+            #ifdef _WIN32
+            // 璁剧疆娓呯悊鏍囧織锛岄槻姝㈠苟鍙戣皟鐢ㄥ拰閲嶆柊鍒濆鍖?            {
+                std::lock_guard<std::mutex> lock(wakeupMutex_);
+                if (isCleaningUp_.load(std::memory_order_acquire)) {
+                    return;
+                }
+                isCleaningUp_.store(true, std::memory_order_release);
+                isShutdown_.store(true, std::memory_order_release);
+            }
+            // Windows娓呯悊IOCP - 鍏堟敹闆嗛渶瑕佸彇娑堢殑鍙ユ焺锛岄伩鍏嶅湪閿佸唴璋冪敤 CancelIoEx
+            std::vector<HANDLE> handlesToCancel;
+            HANDLE handleToClose = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(overlappedMutex_);
+                // 鍏堝皢鎵€鏈夊彞鏌勬爣璁颁负鏃犳晥鐜囷紝閬垮厤鍥炶皟涓娇鐢?                for (auto& pair : overlappedPool_) {
+                    pair.second->fd = INVALID_SOCKET_FD;
+                    pair.second->inUse.store(false, std::memory_order_release);
+                    pair.second->shouldRemove.store(true, std::memory_order_release);
+                    handlesToCancel.push_back((HANDLE)pair.first);
+                    // 绉诲埌寰呭垹闄ゅ垪琛紝寤惰繜鏋愭瀯
+                    pendingDelete_.push_back(std::move(pair.second));
+                }
+                overlappedPool_.clear();
+                handleToClose = iocpHandle_;
+                iocpHandle_ = nullptr;
+            }
+            // 鍦ㄩ攣澶栧彇娑圛O鎿嶄綔锛岄伩鍏嶅洖璋冨湪鎸佹湁閿佺殑鎯呭喌涓嬭瑙﹀彂
+            for (HANDLE h : handlesToCancel) {
+                CancelIoEx(h, nullptr);
+            }
+            // 绛夊緟鍙兘鐨処O瀹屾垚锛岄伩鍏嶈闂凡閲婃斁鍐呭瓨
+            // 浣跨敤涓夊€嶆椂闂达紝纭繚璇佹墍鏈夊洖璋冮兘瀹屾垚
+            // 娉ㄦ剰锛歱oll()绾跨▼鍦ㄦ墽琛屽洖璋冩湡闂存鏌sShutdown_锛屼細璺宠繃鍚庣画鎿嶄綔
+            // 濡傛灉鍥炶皟鎵ц鏃堕棿杈冮暱锛岄渶瑕佹洿澶氱瓑寰呮椂
+            if (handleToClose != nullptr) {
+                // 鍏堢瓑寰卆ctivePolls_?锛岀‘淇濊瘉鎵€鏈塸oll()绾跨▼閮介€€
+                int retryCount = 0;
+                const int maxRetry = 50;  // 鏈€澶氱瓑绉掞紙50 * WINDOWS_CLEANUP_WAIT_MS
+                while (activePolls_.load(std::memory_order_acquire) > 0 && retryCount < maxRetry) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(WINDOWS_CLEANUP_WAIT_MS));
+                    retryCount++;
+                }
+                if (retryCount >= maxRetry && activePolls_.load(std::memory_order_acquire) > 0) {
+                    // 瓒呮椂锛岃褰曡鍛婁絾浠嶇户缁竻鐞?                    // 娉ㄦ剰锛氭鏃跺彲鑳戒粛鏈塸oll()绾跨▼鍦ㄦ墽琛屽洖璋冿紝闇€瑕佸皬蹇冨
+                    LOG_WARN("Timeout waiting for active polls to finish during cleanup");
+                }
+                // 鍏抽棴IOCP鍙ユ焺鍓嶏紝娓呯悊鎵€鏈夊緟鍒犻櫎瀵硅薄
+                // 鍗充娇瓒呮椂锛屼篃瑕佹竻鐞嗭紝浣嗗彲鑳藉湪鏋佸皯鏁版儏鍐典笅鏈夊唴瀛樻硠婕忥紙濡傛灉浠嶆湁IO鍦ㄦ墽琛岋級
+                {
+                    std::lock_guard<std::mutex> lock(overlappedMutex_);
+                    pendingDelete_.clear();
+                }
+                CloseHandle(handleToClose);
+            }
+            #else
+            // 璁剧疆娓呯悊鏍囧織锛岄槻姝㈠苟鍙戣皟鐢ㄥ拰閲嶆柊鍒濆鍖?            {
+                std::lock_guard<std::mutex> lock(wakeupMutex_);
+                if (isCleaningUp_.load(std::memory_order_acquire)) {
+                    return;
+                }
+                isCleaningUp_.store(true, std::memory_order_release);
+                isShutdown_.store(true, std::memory_order_release);
+            }
+            // Linux娓呯悊
+            int fdToClose = -1;
+            int efdToClose = -1;
+            {
+                std::lock_guard<std::mutex> lock(wakeupMutex_);
+                efdToClose = eventFd_;
+                eventFd_ = -1;
+                fdToClose = epollFd_;
+                epollFd_ = -1;
+                // 娓呯悊寰呭鐞嗕簨浠堕槦鍒楋紙鍦ㄩ攣鍐呰繘琛岋級
+                pendingEvents_.clear();
+            }
+            if (efdToClose >= 0) {
+                ::close(efdToClose);
+            }
+            if (fdToClose >= 0) {
+                ::close(fdToClose);
+            }
+            #endif
+        }
+        bool add(socket_t fd, EventType events) noexcept {
+            #ifdef _WIN32
+            // Windows IOCP - 灏唖ocket鍏宠仈鍒板畬鎴愮
+            // 妫€鏌ユ槸鍚﹀凡鍏抽棴锛岄伩鍏嶆搷浣滃凡鍏抽棴鐨勫彞
+            if (isShutdown_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            // 鑾峰彇 iocpHandle_ 鍓湰锛岄伩鍏嶅湪閿佸璁块棶
+            HANDLE iocpToUse = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(wakeupMutex_);
+                iocpToUse = iocpHandle_;
+            }
+            if (iocpToUse == nullptr) {
+                LOG_ERROR("IOCP not initialized");
+                return false;
+            }
+            HANDLE h = CreateIoCompletionPort((HANDLE)fd, iocpToUse, (ULONG_PTR)fd, 0);
+            if (h == nullptr) {
+                LOG_ERROR("CreateIoCompletionPort failed for fd " + std::to_string(fd) + ", error: " + std::to_string(GetLastError()));
+                return false;
+            }
+            // 鍒涘缓閲嶅彔缁撴瀯
+            // 娉ㄦ剰锛氫娇try-catch 鎹曡幏鍙兘bad_alloc 寮傚父锛屽洜涓哄嚱鏁板０鏄庝负 noexcept
+            std::unique_ptr<OverlappedEx> overlapped;
+            try {
+                overlapped = std::make_unique<OverlappedEx>();
+            } catch (const std::bad_alloc&) {
+                LOG_ERROR("Failed to allocate OverlappedEx for fd " + std::to_string(fd) + ", out of memory");
+                return false;
+            }
+            overlapped->fd = fd;
+            overlapped->events = events;
+            // 娉ㄦ剰锛氬鏋滄鍑芥暟杩斿洖 false锛宻ocket 宸茬粡鍏宠仈IOCP ?overlappedPool_ 涓凡娓呯悊
+            // 璋冪敤鑰呭簲鍏抽棴 socket 鍙ユ焺浠ヤ粠 IOCP 涓В闄ゅ叧
+            // 妫€鏌ユ槸鍚﹂渶瑕佹姇閫掑垵濮嬫帴鏀舵搷浣?            bool needRead = hasEvent(events, EventType::Read);
+            {
+                std::lock_guard<std::mutex> lock(overlappedMutex_);
+                overlappedPool_[fd] = std::move(overlapped);
+                // 鍦ㄩ攣鍐呮姇閫掑垵濮嬫帴鏀舵搷浣滐紝閬垮厤绔炰簤鎬佺獥
+                if (needRead) {
+                    OverlappedEx* pOverlapped = overlappedPool_[fd].get();
+                    // 妫€鏌ユ槸鍚﹀凡鍦ㄦ姇閫掍腑
+                    bool expected = false;
+                    if (!pOverlapped->inUse.compare_exchange_strong(expected, true,
+                                                                   std::memory_order_acq_rel,
+                                                                   std::memory_order_acquire)) {
+                        // 宸插湪鎶曢€掍腑锛堜笉搴旇鍙戠敓锛屽洜涓鸿繖鏄垵濮嬫姇閫掞級
+                        // 浣嗙敱浜庡苟鍙戝満鏅紝鍙兘鏄彟涓€涓嚎绋嬫鍦ㄦ搷浣?                        LOG_WARN("Unexpected: inUse already true in add() for fd " + std::to_string(fd));
+                    }
+                    WSABUF wsaBuf;
+                    wsaBuf.buf = pOverlapped->buffer.data();
+                    wsaBuf.len = static_cast<ULONG>(pOverlapped->buffer.size());
+                    DWORD flags = 0;
+                    DWORD bytesRecv = 0;
+                    int result = WSARecv(
+                        fd,
+                        &wsaBuf,
+                        1,
+                        &bytesRecv,
+                        &flags,
+                        &pOverlapped->overlapped,
+                        nullptr
+                    );
+                    if (result == SOCKET_ERROR) {
+                        int error = WSAGetLastError();
+                        if (error != WSA_IO_PENDING) {
+                            // 鎶曢€掑け璐ワ紝闇€瑕佹竻鐞嗗凡鍏宠仈鐨勫彞鏌勫拰璧勬簮
+                            // 娉ㄦ剰锛歐SARecv绔嬪嵆澶辫触锛堥潪WSA_IO_PENDING锛変笉浼氳Е鍙慖OCP鍥炶皟锛屽彲浠ュ畨鍏ㄦ竻鐞?                            // 浣嗘槸涓轰簡瀹夊叏璧疯锛屽厛绉诲埌pendingDelete_锛屽啀浠巔ool鍒犻櫎
+                            pOverlapped->fd = INVALID_SOCKET_FD;
+                            pOverlapped->inUse.store(false, std::memory_order_release);
+                            pOverlapped->shouldRemove.store(true, std::memory_order_release);
+                            // 鍏堢Щ鍒板緟鍒犻櫎鍒楄〃锛堜繚鎸佸璞″瓨娲伙級
+                            pendingDelete_.push_back(std::move(overlappedPool_[fd]));
+                            // 鍐嶄粠pool涓垹闄わ紙姝ゆ椂瀵硅薄宸茬粡鍦╬endingDelete_涓級
+                            overlappedPool_.erase(fd);
+                            LOG_ERROR("WSARecv failed for fd " + std::to_string(fd) + ", error: " + std::to_string(error));
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
+            #else
+            // Linux epoll娣诲姞
+            // 妫€鏌ユ槸鍚﹀凡鍏抽棴锛岄伩鍏嶆搷浣滃凡鍏抽棴鐨勫彞
+            if (isShutdown_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            struct epoll_event ev;
+            ev.events = eventTypeToEpollEvents(events);
+            ev.data.fd = fd;
+            // 鑾峰彇 epollFd_ 鍓湰锛岄伩鍏嶅湪閿佸璁块棶
+            int epollFdToUse = -1;
+            {
+                std::lock_guard<std::mutex> lock(wakeupMutex_);
+                epollFdToUse = epollFd_;
+            }
+            if (epollFdToUse < 0 || epoll_ctl(epollFdToUse, EPOLL_CTL_ADD, fd, &ev) != 0) {
+                int err = errno;
+                LOG_ERROR("epoll_ctl ADD failed for fd " + std::to_string(fd) + ", errno: " + std::to_string(err));
+                return false;
+            }
+            return true;
+            #endif
+        }
+        bool modify(socket_t fd, EventType events) noexcept {
+            #ifdef _WIN32
+            // Windows IOCP淇敼浜嬩欢绫诲瀷
+            // 妫€鏌ユ槸鍚﹀凡鍏抽棴锛岄伩鍏嶆搷浣滃凡鍏抽棴鐨勫彞
+            if (isShutdown_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            {
+                std::lock_guard<std::mutex> lock(overlappedMutex_);
+                auto it = overlappedPool_.find(fd);
+                if (it == overlappedPool_.end()) {
+                    return false;
+                }
+                // 妫€鏌ユ槸鍚﹂渶瑕佹姇閫掓柊鐨勬帴鏀舵搷浣?                bool hadRead = hasEvent(it->second->events, EventType::Read);
+                bool hasRead = hasEvent(events, EventType::Read);
+                // 鍏堟洿鏂癳vents锛屾棤璁烘槸鍚﹂渶瑕佹姇
+                it->second->events = events;
+                // 濡傛灉涔嬪墠娌℃湁璇荤幇鍦ㄦ湁璇伙紝鎶曢€掓帴鏀舵搷浣?                if (!hadRead && hasRead) {
+                    OverlappedEx* pOverlapped = it->second.get();
+                    // 妫€鏌ユ槸鍚﹀凡鍦ㄦ姇閫掍腑
+                    bool expected = false;
+                    if (!pOverlapped->inUse.compare_exchange_strong(expected, true,
+                                                                   std::memory_order_acq_rel,
+                                                                   std::memory_order_acquire)) {
+                        // 宸插湪鎶曢€掍腑锛屾棤闇€閲嶅鎶?                        // events宸茬粡鏇存柊锛岀洿鎺ヨ繑
+                        return true;
+                    }
+                    // 鍘熷瓙璁剧疆inUse鍚庯紝鍐嶆妫€鏌houldRemove锛堥槻姝㈢珵浜夋€侊級
+                    // 鍥犱负鍦ㄦ鏌ュ拰璁剧疆inUse涔嬮棿锛宺emove()鍙兘璁剧疆浜唖houldRemove
+                    if (pOverlapped->shouldRemove.load(std::memory_order_acquire)) {
+                        pOverlapped->inUse.store(false, std::memory_order_release);
+                        return false;
+                    }
+                    WSABUF wsaBuf;
+                    wsaBuf.buf = pOverlapped->buffer.data();
+                    wsaBuf.len = static_cast<ULONG>(pOverlapped->buffer.size());
+                    DWORD flags = 0;
+                    DWORD bytesRecv = 0;
+                    int result = WSARecv(
+                        fd,
+                        &wsaBuf,
+                        1,
+                        &bytesRecv,
+                        &flags,
+                        &pOverlapped->overlapped,
+                        nullptr
+                    );
+                    if (result == SOCKET_ERROR) {
+                        int error = WSAGetLastError();
+                        if (error != WSA_IO_PENDING) {
+                            // 鎶曢€掑け璐ワ紝涓€娆℃€у畬鎴愭墍鏈夋爣璁帮紝閬垮厤move 鍚庤
+                            pOverlapped->inUse.store(false, std::memory_order_release);
+                            pOverlapped->shouldRemove.store(true, std::memory_order_release);
+                            pOverlapped->fd = INVALID_SOCKET_FD;
+                            // 绉诲叆 pendingDelete_锛坢ove 鍚庝笉鍐嶈it->second
+                            pendingDelete_.push_back(std::move(it->second));
+                            overlappedPool_.erase(it);
+                            LOG_ERROR("WSARecv failed in modify() for fd " + std::to_string(fd) + ", error: " + std::to_string(error));
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
+            #else
+            // Linux epoll淇敼
+            // 妫€鏌ユ槸鍚﹀凡鍏抽棴锛岄伩鍏嶆搷浣滃凡鍏抽棴鐨勫彞
+            if (isShutdown_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            struct epoll_event ev;
+            ev.events = eventTypeToEpollEvents(events);
+            ev.data.fd = fd;
+            // 鑾峰彇 epollFd_ 鍓湰锛岄伩鍏嶅湪閿佸璁块棶
+            int epollFdToUse = -1;
+            {
+                std::lock_guard<std::mutex> lock(wakeupMutex_);
+                epollFdToUse = epollFd_;
+            }
+            if (epollFdToUse < 0 || epoll_ctl(epollFdToUse, EPOLL_CTL_MOD, fd, &ev) != 0) {
+                int err = errno;
+                LOG_ERROR("epoll_ctl MOD failed for fd " + std::to_string(fd) + ", errno: " + std::to_string(err));
+                return false;
+            }
+            return true;
+            #endif
+        }
+        bool remove(socket_t fd) noexcept {
+            #ifdef _WIN32
+            // Windows IOCP绉婚櫎
+            // 妫€鏌ユ槸鍚﹀凡鍏抽棴锛岄伩鍏嶆搷浣滃凡鍏抽棴鐨勫彞
+            if (isShutdown_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            bool found = false;
+            {
+                std::lock_guard<std::mutex> lock(overlappedMutex_);
+                auto it = overlappedPool_.find(fd);
+                if (it != overlappedPool_.end()) {
+                    // 鏍囪涓烘棤
+                    it->second->fd = INVALID_SOCKET_FD;
+                    it->second->shouldRemove.store(true, std::memory_order_release);
+                    // 妫€IO 鏄惁姝ｅ湪杩涜锛堝湪璁剧疆 shouldRemove 涔嬪悗妫€鏌ワ級
+                    // 杩欐牱鍙互閬垮厤poll() 閲嶇疆 inUse 鐨勭珵浜夛細
+                    // - 濡傛灉 poll() 鍏堣shouldRemove锛岃繖閲屼笉浼氭inUse
+                    // - 濡傛灉 poll() 鍚庨噸inUse锛岃繖閲岀殑妫€鏌ユ槸鍑嗙‘
+                    bool inUse = it->second->inUse.load(std::memory_order_acquire);
+                    // 鏃犺 IO 鏄惁姝ｅ湪杩涜锛岄兘鍙爣璁颁笉绉婚櫎
+                    // 杩欐牱鍙互閬垮厤poll() 涓悓鏃剁ЩOverlappedEx 鐨勭珵浜夋潯浠?                    // poll() 浼氭shouldRemove 鏍囧織骞跺鐞嗗悗缁竻鐞?                    // 濡傛灉 IO 宸插畬鎴愶紝鍙互瀹夊叏绉婚櫎pendingDelete_
+                    if (!inUse) {
+                        // 绉诲嚭闃熷垪锛屾坊鍔犲埌寰呭垹闄ゅ垪琛紝寤惰繜鏋愭瀯
+                        pendingDelete_.push_back(std::move(it->second));
+                        overlappedPool_.erase(it);
+                    }
+                    found = true;
+                }
+            }
+            // 鍦ㄩ攣澶栧彇娑圛O鎿嶄綔锛岄伩鍏嶅洖璋冨湪鎸佹湁閿佺殑鎯呭喌涓嬭瑙﹀彂
+            if (found) {
+                // 娉ㄦ剰锛欳ancelIoEx 鍙兘鍙栨秷璋冪敤绾跨▼涓彂璧风殑銆佹湭瀹屾垚鐨処O
+                // 宸插畬鎴愮殑IO浠嶄細瑙﹀彂鍥炶皟锛屽洜姝ら€氳繃 shouldRemove 鏍囧織杩囨护
+                CancelIoEx((HANDLE)fd, nullptr);
+            }
+            return found;
+            // 娉ㄦ剰锛歱endingDelete_ ?poll() 鍑芥暟鏈熬娓呯悊锛岀‘淇濊瘉IO鍥炶皟瀹屾垚
+            #else
+            // Linux epoll绉婚櫎
+            // 妫€鏌ユ槸鍚﹀凡鍏抽棴锛岄伩鍏嶆搷浣滃凡鍏抽棴鐨勫彞
+            if (isShutdown_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            // 鑾峰彇 epollFd_ 鍓湰锛岄伩鍏嶅湪閿佸璁块棶
+            int epollFdToUse = -1;
+            {
+                std::lock_guard<std::mutex> lock(wakeupMutex_);
+                epollFdToUse = epollFd_;
+            }
+            if (epollFdToUse < 0) {
+                return false;
+            }
+            int result = epoll_ctl(epollFdToUse, EPOLL_CTL_DEL, fd, nullptr);
+            if (result < 0) {
+                // 濡傛灉socket涓嶅瓨ENOENT)鎴栧凡鍏抽棴(EBADF)锛岃涓烘垚
+                // 鍥犱负澶栭儴鍙兘宸茬粡鍏抽棴浜唖ocket
+                int err = errno;
+                if (err == ENOENT || err == EBADF) {
+                    return true;
+                }
+                // 鍏朵粬閿欒锛欵INTR鍙噸璇曪紝EINVAL鏃犳晥鐜囧弬鏁帮紝ENOMEM鍐呭瓨涓嶈冻
+                LOG_ERROR("epoll_ctl DEL failed for fd " + std::to_string(fd) + ", errno: " + std::to_string(err));
+                return false;
+            }
+            return true;
+            #endif
+        }
+        int poll(int timeoutMs, std::map<socket_t, EventData>& eventMap, std::shared_mutex& mutex) noexcept {
+            #ifdef _WIN32
+            // 鑾峰彇 IOCP 鍙ユ焺鍓湰骞舵鏌ユ槸鍚︽湁鏁堢巼锛堥槻姝?cleanup() 骞跺彂璋冪敤
+            HANDLE iocpToUse = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(wakeupMutex_);
+                iocpToUse = iocpHandle_;
+                if (iocpToUse == nullptr) {
+                    return -1;
+                }
+            }
+            // 妫€鏌ユ槸鍚﹀凡鍏抽棴锛岄伩鍏嶆搷浣滃凡鍏抽棴鐨勫彞
+            // 娉ㄦ剰锛氬繀椤诲湪鑾峰彇iocpHandle_鍓湰涔嬪悗妫€鏌sShutdown_
+            // 鍥犱负cleanup()鍙兘鍦ㄨ幏鍙栧壇鏈悗璁剧疆isShutdown_
+            if (isShutdown_.load(std::memory_order_acquire)) {
+                return -1;
+            }
+            // Windows浣跨敤IOCP瀹炵幇 - 鎵归噺鑾峰彇澶氫釜瀹屾垚浜嬩欢浠ユ彁鍗囨€ц兘
+            OVERLAPPED_ENTRY entries[MAX_POLL_BATCH_SIZE];
+            ULONG numEntriesRemoved = 0;
+            DWORD timeout = (timeoutMs < 0) ? INFINITE : static_cast<DWORD>(timeoutMs);
+            // 閫掑娲诲姩poll璁℃暟锛岀‘淇濊瘉cleanup()涓嶄細鍏抽棴姝ｅ湪浣跨敤鐨刬ocpHandle_
+            activePolls_.fetch_add(1, std::memory_order_acq_rel);
+            // 浣跨敤GetQueuedCompletionStatusEx鎵归噺鑾峰彇澶氫釜瀹屾垚浜嬩欢
+            BOOL result = GetQueuedCompletionStatusEx(
+                iocpToUse,
+                entries,
+                MAX_POLL_BATCH_SIZE,
+                &numEntriesRemoved,
+                timeout,
+                FALSE  // 涓嶅彲璀﹀憡妯″紡
+            );
+            if (!result) {
+                DWORD error = GetLastError();
+                if (error == WAIT_TIMEOUT) {
+                    // 閫掑噺娲诲姩poll璁℃暟锛堣秴鏃舵儏鍐碉級
+                    activePolls_.fetch_sub(1, std::memory_order_acq_rel);
+                    return 0;  // 瓒呮椂
+                }
+                LOG_ERROR("GetQueuedCompletionStatusEx failed, error: " + std::to_string(error));
+                // 閫掑噺娲诲姩poll璁℃暟锛堥敊璇儏鍐碉級
+                activePolls_.fetch_sub(1, std::memory_order_acq_rel);
+                return -1;  // 閿欒
+            }
+            // 鍏堝鍒舵墍鏈夐渶瑕佹墽琛岀殑鍥炶皟锛岄伩鍏嶆寔鏈夐攣鏈熼棿璋冪敤鍥炶皟
+            std::vector<WindowsCallbackInfo> callbacks;
+            callbacks.reserve(numEntriesRemoved);
+            {
+                std::shared_lock<std::shared_mutex> lock(mutex);
+                for (ULONG i = 0; i < numEntriesRemoved; ++i) {
+                    LPOVERLAPPED lpOverlapped = entries[i].lpOverlapped;
+                    if (lpOverlapped == nullptr) {
+                        continue;  // 鍞ら啋浜嬩欢
+                    }
+                    OverlappedEx* pOverlappedEx = CONTAINING_RECORD(lpOverlapped, OverlappedEx, overlapped);
+                    // 鍦ㄨpOverlappedEx 涔嬪墠锛屾鏌ュ璞℃槸鍚︿粛鐒舵湁
+                    // 闃叉璁块棶宸茶閲婃斁鐨勫唴瀛橈紙鎮┖鎸囬拡
+                    {
+                        std::lock_guard<std::mutex> overlappedLock(overlappedMutex_);
+                        bool isValid = false;
+                        // 妫€鏌ユ槸鍚﹀湪 overlappedPool_ 
+                        auto poolIt = overlappedPool_.find(pOverlappedEx->fd);
+                        if (poolIt != overlappedPool_.end() && poolIt->second.get() == pOverlappedEx) {
+                            isValid = true;
+                        }
+                        // 妫€鏌ユ槸鍚﹀湪 pendingDelete_ 
+                        if (!isValid) {
+                            for (const auto& overlapped : pendingDelete_) {
+                                if (overlapped.get() == pOverlappedEx) {
+                                    isValid = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!isValid) {
+                            // 瀵硅薄宸茶閿€姣侊紝璺宠繃
+                            continue;
+                        }
+                    }
+                    // 妫€鏌ocket鏄惁宸茶绉婚櫎鎴栨爣璁颁负闇€瑕佺Щ
+                    // 娉ㄦ剰锛氬繀椤诲湪璇诲彇fd涔嬪墠妫€鏌ワ紝閬垮厤TOCTOU绔炰簤
+                    if (pOverlappedEx->fd == INVALID_SOCKET_FD || pOverlappedEx->shouldRemove.load(std::memory_order_acquire)) {
+                        continue;
+                    }
+                    socket_t fd = pOverlappedEx->fd;
+                    DWORD bytesTransferred = entries[i].dwNumberOfBytesTransferred;
+                    // IO 瀹屾垚鍚庡厛鏌ユ壘鍥炶皟锛屽啀閲嶇疆 inUse 鏍囪
+                    // 閬垮厤鍦ㄩ噸inUse ?remove() 璇IO 宸插畬
+                    auto it = eventMap.find(fd);
+                    if (it == eventMap.end()) {
+                        // eventMap涓凡涓嶅瓨鍦紝娓呯悊 overlappedPool
+                        // 涓嶉渶瑕佺珛鍗虫竻鐞嗭紝鍥犱负
+                        // 1. remove() 浼氬鐞嗘竻鐞?                        // 2. shutdown() 浼氭竻鐞嗘墍
+                        // 3. 涓嬫 poll() 浼氬彂shouldRemove 鏍囧織骞跺
+                        // 閲嶇疆 inUse 浠ヤ究鍚庣画 postReceive() 鍙互姝ｅ父宸ヤ綔
+                        pOverlappedEx->inUse.store(false, std::memory_order_release);
+                        continue;
+                    }
+                    // eventMap 涓瓨鍦紝閲嶇疆 inUse 鏍囪锛屽厑璁稿悗缁姇
+                    pOverlappedEx->inUse.store(false, std::memory_order_release);
+                    if (it->second.callback) {
+                        EventType triggered = EventType::None;
+                        bool shouldRemove = false;
+                        if (bytesTransferred > 0) {
+                            // 姝ｅ父鏁版嵁鎺ユ敹
+                            // 娉ㄦ剰锛氶渶瑕佹鏌ventMap涓殑鏈€鏂癳vents锛岃€屼笉鏄痮verlapped涓殑events
+                            // 鍥犱负鐢ㄦ埛鍙兘鍦ㄦ姇閫掑悗璋冪敤浜唌odify()锛屼慨鏀逛簡浜嬩欢绫诲瀷
+                            if (hasEvent(it->second.events, EventType::Read)) {
+                                triggered = EventType::Read;
+                            }
+                            // 濡傛灉eventMap涓病鏈塕ead锛屽拷鐣ヨ繖涓暟鎹紙鐢ㄦ埛涓嶅啀鍏冲績璇讳簨浠讹級
+                        } else {
+                            // bytesTransferred == 0 琛ㄧず杩炴帴鍏抽棴鎴栭敊
+                            // ?IOCP 涓紝閫氬父鎰忓懗鐫€瀵圭鍏抽棴杩炴帴
+                            triggered = EventType::Close;
+                            shouldRemove = true;
+                        }
+                        // 妫€鏌ventMap涓殑鏈€鏂癳vents锛岃€屼笉鏄痮verlapped涓殑events
+                        // 鍥犱负鐢ㄦ埛鍙兘鍦ㄦ姇閫掑悗璋冪敤浜唌odify()锛屼慨鏀逛簡浜嬩欢绫诲瀷
+                        bool needPostRecv = hasEvent(it->second.events, EventType::Read);
+                        // 淇濊瘉瀛樺洖璋冿紝閬垮厤閿佸浜屾鏌?                        callbacks.push_back({fd, triggered, it->second.callback, needPostRecv, shouldRemove,
+                            (bytesTransferred > 0) ? pOverlappedEx->buffer.data() : nullptr,
+                            static_cast<size_t>(bytesTransferred)});
+                    }
+                }
+            }
+            // 鍦ㄩ攣澶栨墽琛屽洖
+            // 娉ㄦ剰锛氫笉鍦ㄥ洖璋冩墽琛屾湡闂存寔鏈変换浣曢攣锛岄伩鍏嶆
+            for (const auto& cb : callbacks) {
+                // 妫€鏌ユ槸鍚﹀凡缁弒hutdown锛岄伩鍏嶅湪鍥炶皟鎵ц鏈熼棿璁块棶宸查噴鏀捐祫
+                if (isShutdown_.load(std::memory_order_acquire)) {
+                    // 宸茬粡shutdown锛岃烦杩囨墍鏈夊悗缁洖
+                    break;
+                }
+                if (cb.callback) {
+                    // 闃叉鍥炶皟閲嶅叆锛岄伩鍏嶇姸鎬佷笉涓€
+                    bool expected = false;
+                    if (!inCallback_.compare_exchange_strong(expected, true,
+                                                          std::memory_order_acq_rel,
+                                                          std::memory_order_acquire)) {
+                        // 宸茬粡鍦ㄥ洖璋冧腑锛岃烦杩囷紙娉ㄦ剰锛氫笉瑕侀噸inCallback_锛屽洜涓哄畠鍙兘灞炰簬鍙︿竴涓嚎绋嬶級
+                        LOG_WARN("Recursive callback detected for fd " + std::to_string(cb.fd) + ", skipping");
+                        continue;
+                    }
+                    cb.callback(cb.fd, cb.triggered, cb.data, cb.len);
+                    inCallback_.store(false, std::memory_order_release);
+                    // 妫€鏌ユ槸鍚﹀湪鍥炶皟鏈熼棿琚玸hutdown
+                    if (isShutdown_.load(std::memory_order_acquire)) {
+                        // 宸茬粡shutdown锛岃烦杩囧悗缁搷浣?                        continue;
+                    }
+                }
+            }
+            // 鍥炶皟鎵ц瀹屾垚鍚庯紝缁熶竴澶勭悊闇€瑕佸垹闄ょ殑fd鍜岄噸鏂版姇閫掓搷浣?            // 杩欐牱鍙互閬垮厤鍦ㄥ洖璋冩湡闂存寔鏈夐攣锛岄槻姝㈡
+            for (const auto& cb : callbacks) {
+                // 閲嶆柊妫€鏌ユ槸鍚﹀湪鍥炶皟鏈熼棿琚玸hutdown
+                if (isShutdown_.load(std::memory_order_acquire)) {
+                    break;
+                }
+                // 濡傛灉闇€瑕佺Щ闄ocket锛岃嚜鍔ㄤ粠 eventMap 绉婚櫎
+                if (cb.shouldRemove) {
+                    // 娉ㄦ剰锛歰verlappedPool_ 宸茬粡remove() 涓垹闄わ紝杩欓噷涓嶅啀閲嶅鍒犻櫎
+                    std::unique_lock<std::shared_mutex> lock(mutex);
+                    eventMap.erase(cb.fd);
+                }
+                // 閲嶆柊鎶曢€掓帴鏀舵搷浣滐紙浠呭湪闇€瑕佷笖socket鏈绉婚櫎鏃讹級
+                if (cb.needPostReceive && !cb.shouldRemove) {
+                    postReceive(cb.fd);
+                }
+            }
+            // 娓呯悊寰呭垹闄ょ殑 OverlappedEx锛堝湪鍥炶皟鎵ц鍚庯級
+            // 鍙竻鐞咺O宸插畬鎴愮殑瀵硅薄锛岄伩鍏嶉噴鏀炬鍦↖O涓殑鍐呭瓨
+            // 濡傛灉pendingDelete_澶ぇ锛屽己鍒舵竻鐞嗕互闃叉鍐呭瓨娉勬紡
+            {
+                std::lock_guard<std::mutex> lock(overlappedMutex_);
+                size_t sizeBefore = pendingDelete_.size();
+                auto it = std::remove_if(pendingDelete_.begin(), pendingDelete_.end(),
+                    [](const auto& overlapped) {
+                        return !overlapped->inUse.load(std::memory_order_acquire);
+                    });
+                size_t removed = std::distance(it, pendingDelete_.end());
+                pendingDelete_.erase(it, pendingDelete_.end());
+                if (removed > 0 && sizeBefore > PENDING_DELETE_THRESHOLD) {
+                    LOG_DEBUG("Cleaned " + std::to_string(removed) + " completed OverlappedEx from pendingDelete_ (" + std::to_string(pendingDelete_.size()) + " remaining)");
+                }
+            }
+            // 閫掑噺娲诲姩poll璁℃暟锛堝湪鍥炶皟鎵ц瀹屾垚鍚庯級
+            // 娉ㄦ剰锛氬繀椤诲湪鎵€鏈夊洖璋冨拰娓呯悊瀹屾垚鍚庢墠閫掑噺锛屽惁鍒檆leanup()鍙兘鍦ㄥ洖璋冧粛鍦ㄦ墽琛屾椂鍏抽棴鍙ユ焺
+            activePolls_.fetch_sub(1, std::memory_order_acq_rel);
+            return static_cast<int>(callbacks.size());
+            #else
+            // Linux浣跨敤epoll瀹炵幇
+            // 鍏堟鏌ユ槸鍚︽湁寰呭鐞嗕簨
+            // 娉ㄦ剰锛歱endingEvents_ 璁块棶闇€瑕佸姞閿佷繚璇?            std::vector<PendingEvent> eventsToProcess;
+            {
+                std::lock_guard<std::mutex> lock(wakeupMutex_);
+                if (!pendingEvents_.empty()) {
+                    size_t batchSize = std::min(pendingEvents_.size(), maxBatchSize_);
+                    eventsToProcess.reserve(batchSize);
+                    for (size_t i = 0; i < batchSize && !pendingEvents_.empty(); ++i) {
+                        eventsToProcess.push_back(pendingEvents_.front());
+                        pendingEvents_.pop_front();
+                    }
+                }
+            }
+            // 妫€鏌ユ槸鍚﹀凡鍏抽棴锛岄伩鍏嶆搷浣滃凡鍏抽棴鐨勫彞
+            // 娉ㄦ剰锛氬繀椤诲湪澶勭悊pendingEvents_涔嬪悗妫€鏌sShutdown_
+            if (isShutdown_.load(std::memory_order_acquire)) {
+                return -1;
+            }
+            // 閫掑娲诲姩poll璁℃暟锛岀‘淇濊瘉cleanup()涓嶄細娓呯悊pendingEvents_鎴栧叧闂璭pollFd_
+            // 娉ㄦ剰锛氬湪鏁翠釜poll()鎵ц鏈熼棿淇濇寔activePolls_閫掑锛屽寘鎷琾endingEvents_澶勭悊鍜宔poll_wait
+            activePolls_.fetch_add(1, std::memory_order_acq_rel);
+            if (!eventsToProcess.empty()) {
+                // 鎵归噺澶勭悊寰呭鐞嗕簨
+                int processed = 0;
+                // 鍏堝鍒跺洖璋冧俊鎭埌涓存椂鍚戦噺锛岄伩鍏嶆寔鏈夐攣鏈熼棿璋冪敤鍥炶皟
+                std::vector<CallbackInfo> callbacks;
+                callbacks.reserve(eventsToProcess.size());
+                {
+                    std::shared_lock<std::shared_mutex> lock(mutex);
+                    for (const auto& event : eventsToProcess) {
+                        socket_t fd = event.fd;
+                        auto it = eventMap.find(fd);
+                        if (it != eventMap.end() && it->second.callback) {
+                            // 淇濊瘉瀛樺洖璋冿紝閬垮厤閿佸浜屾鏌?                            callbacks.push_back({fd, event.triggered, it->second.callback, nullptr, 0});
+                        }
+                    }
+                }
+                // 鍦ㄩ攣澶栨墽琛屽洖
+                // 鍏堟敹闆嗛渶瑕佺Щ闄ょ殑 fd锛岄伩鍏嶅湪鍥炶皟寰幆涓娆¤幏鍙栭攣
+                std::vector<socket_t> toRemove;
+                toRemove.reserve(callbacks.size());
+                for (const auto& cb : callbacks) {
+                    // 妫€鏌ユ槸鍚﹀凡缁弒hutdown锛岄伩鍏嶅湪鍥炶皟鎵ц鏈熼棿璁块棶宸查噴鏀捐祫
+                    if (isShutdown_.load(std::memory_order_acquire)) {
+                        // 宸茬粡shutdown锛岃烦杩囨墍鏈夊悗缁洖
+                        break;
+                    }
+                    if (cb.callback) {
+                        cb.callback(cb.fd, cb.triggered, nullptr, 0);
+                        // 妫€鏌ユ槸鍚﹀湪鍥炶皟鏈熼棿琚玸hutdown
+                        if (isShutdown_.load(std::memory_order_acquire)) {
+                            // 宸茬粡shutdown锛岃烦杩囧悗缁搷浣?                            break;
+                        }
+                        // 濡傛灉Close 浜嬩欢锛屾敹闆嗛渶瑕佺Щ闄ょ殑 fd
+                        if (hasEvent(cb.triggered, EventType::Close)) {
+                            toRemove.push_back(cb.fd);
+                        }
+                    }
+                    processed++;
+                }
+                // 妫€鏌ユ槸鍚﹀湪鍥炶皟鏈熼棿琚玸hutdown
+                if (isShutdown_.load(std::memory_order_acquire)) {
+                    // 宸茬粡shutdown锛岄€掑噺activePolls_骞惰繑
+                    // 涓嶅啀鎵цepoll_ctl DEL鎿嶄綔锛岄伩鍏嶈闂凡鍏抽棴鐨別pollFd_
+                    activePolls_.fetch_sub(1, std::memory_order_acq_rel);
+                    return processed;
+                }
+                // 鑾峰彇 epollFd_ 鍓湰锛岄伩鍏嶅湪閿佸璁块棶
+                int epollFdToUse = -1;
+                {
+                    std::lock_guard<std::mutex> lock(wakeupMutex_);
+                    epollFdToUse = epollFd_;
+                }
+                // 鎵归噺绉婚櫎 socket锛屽彧鑾峰彇涓€娆￠攣
+                if (!toRemove.empty()) {
+                    std::unique_lock<std::shared_mutex> lock(mutex);
+                    for (socket_t fd : toRemove) {
+                        eventMap.erase(fd);
+                    }
+                }
+                // 鍦ㄩ攣澶栨墽epoll_ctl锛岄伩鍏嶆寔鏈夐攣鏈熼棿璋冪敤绯荤粺鍑芥暟
+                if (epollFdToUse >= 0) {
+                    for (socket_t fd : toRemove) {
+                        int result = epoll_ctl(epollFdToUse, EPOLL_CTL_DEL, fd, nullptr);
+                        if (result < 0) {
+                            int err = errno;
+                            // ENOENT鎴朎BADF琛ㄧず宸蹭笉瀛樺湪锛屽彲浠ュ拷
+                            if (err != ENOENT && err != EBADF) {
+                                  LOG_WARN("epoll_ctl DEL failed for fd " + std::to_string(fd) + ", errno: " + std::to_string(err));
+                            }
+                        }
+                    }
+                }
+                // 濡傛灉寰呭鐞嗕簨浠惰繕寰堝锛岀户缁
+                bool hasMoreEvents = false;
+                {
+                    std::lock_guard<std::mutex> lock(wakeupMutex_);
+                    hasMoreEvents = !pendingEvents_.empty();
+                }
+                if (hasMoreEvents) {
+                    // 閬垮厤闃诲澶箙锛岄€掑噺activePolls_骞惰繑鍥烇紝璁╀笅娆oll()缁х画澶勭悊
+                    activePolls_.fetch_sub(1, std::memory_order_acq_rel);
+                    return processed;
+                }
+                // 濡傛灉娌℃湁鏇村寰呭鐞嗕簨浠讹紝缁х画璋冪敤epoll_wait绛夊緟鏂颁簨
+                // 娉ㄦ剰锛氫笉瑕佸湪杩欓噷閫掑噺activePolls_锛屽洜涓鸿繕瑕佽皟鐢╡poll_wait
+            }
+            // 妫€鏌ユ槸鍚﹀凡鍏抽棴锛岄伩鍏嶆搷浣滃凡鍏抽棴鐨勫彞
+            // 娉ㄦ剰锛氬繀椤诲湪鑾峰彇epollFd_鍓湰涔嬪悗妫€鏌sShutdown_
+            // 鍥犱负cleanup()鍙兘鍦ㄨ幏鍙栧壇鏈悗璁剧疆isShutdown_
+            int epollFdToUse = -1;
+            {
+                std::lock_guard<std::mutex> lock(wakeupMutex_);
+                epollFdToUse = epollFd_;
+            }
+            if (epollFdToUse < 0) {
+                // 閫掑噺娲诲姩poll璁℃暟锛坋pollFd鏃犳晥鐜囨儏鍐?                activePolls_.fetch_sub(1, std::memory_order_acq_rel);
+                return -1;
+            }
+            // 妫€鏌ユ槸鍚﹀凡鍏抽棴锛岄伩鍏嶆搷浣滃凡鍏抽棴鐨勫彞
+            // 娉ㄦ剰锛氬繀椤诲湪epollFd_鏈夋晥鐜囦箣鍚庢鏌sShutdown_
+            // 鍥犱负cleanup()鍙兘鍦ㄦ鏌pollFd_涔嬪悗璁剧疆isShutdown_
+            if (isShutdown_.load(std::memory_order_acquire)) {
+                // 閫掑噺娲诲姩poll璁℃暟锛堝凡鍏抽棴鎯呭喌
+                activePolls_.fetch_sub(1, std::memory_order_acq_rel);
+                return -1;
+            }
+            // 绛夊緟鏂颁簨
+            int nfds = epoll_wait(epollFdToUse, events_.data(), static_cast<int>(maxEvents_), timeoutMs);
+            if (nfds < 0) {
+                // epoll_wait 閿欒锛岄潪 EINTR 閿欒鎵嶈褰曟棩
+                if (errno != EINTR) {
+                    LOG_ERROR("epoll_wait failed, errno: " + std::to_string(errno));
+                }
+                // 閫掑噺娲诲姩poll璁℃暟骞惰繑
+                activePolls_.fetch_sub(1, std::memory_order_acq_rel);
+                return nfds;
+            }
+            if (nfds == 0) {
+                // 瓒呮椂锛岄€掑噺娲诲姩poll璁℃暟骞惰繑
+                activePolls_.fetch_sub(1, std::memory_order_acq_rel);
+                return 0;
+            }
+            if (nfds > 0) {
+                int eventCount = 0;
+                int droppedEvents = 0;
+                // 鑾峰彇 eventFd_ 鍓湰鐢ㄤ簬娓呯悊闄ゅ敜閱掍簨浠讹紙鍦ㄥ惊鐜鑾峰彇涓€娆★紝鍑忓皯閿佺珵浜夛級
+                int eventFdToUse = -1;
+                {
+                    std::lock_guard<std::mutex> lock(wakeupMutex_);
+                    eventFdToUse = eventFd_;
+                }
+                // 灏嗕簨浠舵坊鍔犲埌寰呭鐞嗛槦
+                for (int i = 0; i < nfds; ++i) {
+                    socket_t fd = events_[i].data.fd;
+                    // 妫€鏌ユ槸鍚︽槸鍞ら啋浜嬩欢
+                    if (eventFdToUse >= 0 && fd == eventFdToUse) {
+                        // 璇诲彇eventfd娓呯悊闄や簨浠?                        uint64_t val;
+                        ssize_t bytesRead = ::read(eventFdToUse, &val, sizeof(val));
+                        if (bytesRead == -1) {
+                            // 璇诲彇澶辫触锛岄€氬父EAGAIN ?EWOULDBLOCK锛屽彲浠ュ拷
+                            // 鍏朵粬閿欒璇存槑eventfd鍙兘宸插叧闂紝璁板綍鏃ュ織
+                            int err = errno;
+                            if (err != EAGAIN && err != EWOULDBLOCK) {
+                                LOG_WARN("eventfd read failed, errno: " + std::to_string(err));
+                            }
+                        }
+                        continue;  // 璺宠繃鍞ら啋浜嬩欢
+                    }
+                    EventType triggered = EventType::None;
+                    if (events_[i].events & EPOLLIN) {
+                        triggered |= EventType::Read;
+                    }
+                    if (events_[i].events & EPOLLOUT) {
+                        triggered |= EventType::Write;
+                    }
+                    if (events_[i].events & EPOLLHUP) {
+                        triggered |= EventType::Close;
+                    }
+                    if (events_[i].events & (EPOLLERR | EPOLLRDHUP)) {
+                        // 鍖哄垎閰嶉敊璇被鍨?                        if (events_[i].events & EPOLLRDHUP) {
+                            triggered |= EventType::Close;  // 瀵规柟鍏抽棴杩炴帴
+                        } else {
+                            triggered |= EventType::Error;  // 鐪熸鐨勯敊
+                        }
+                    }
+                    // 妫€鏌ュ緟澶勭悊闃熷垪澶у皬锛岄槻姝㈡棤闄愬埗澧?                    // 娉ㄦ剰锛歱endingEvents_ 璁块棶闇€瑕佸姞閿佷繚璇?                    bool canAdd = false;
+                    {
+                        std::lock_guard<std::mutex> lock(wakeupMutex_);
+                        if (pendingEvents_.size() < maxPendingEvents_) {
+                            pendingEvents_.emplace_back(fd, triggered);
+                            canAdd = true;
+                        }
+                    }
+                    if (canAdd) {
+                        eventCount++;
+                    } else {
+                        // 寰呭鐞嗛槦鍒楀凡婊★紝涓㈠純浜嬩欢
+                        droppedEvents++;
+                        LOG_WARN("Pending events queue full, dropped event for fd " + std::to_string(fd));
+                    }
+                }
+                // 濡傛灉鏈変簨浠惰涓㈠純锛岃繑鍥炶礋鏁拌〃绀烘湁浜嬩欢涓㈠け
+                // 杩斿洖鍊艰涔夛細姝ｆ暟=澶勭悊鐨勪簨浠舵暟锛岃礋鏁扮粷瀵瑰鐞嗙殑浜嬩欢鏁颁絾鏈変簨浠朵涪寮?鏃犱簨
+                if (droppedEvents > 0) {
+                    LOG_WARN("Dropped " + std::to_string(droppedEvents) + " events due to pending queue overflow");
+                    // 閫掑噺娲诲姩poll璁℃暟骞惰繑
+                    activePolls_.fetch_sub(1, std::memory_order_acq_rel);
+                    return -static_cast<int>(eventCount);  // 璐熸暟琛ㄧず鏈変簨浠惰涓㈠純
+                }
+                // 閫掑噺娲诲姩poll璁℃暟骞惰繑
+                activePolls_.fetch_sub(1, std::memory_order_acq_rel);
+                return static_cast<int>(eventCount);
+            }
+            // 涓嶅簲璇ュ埌杈捐繖閲岋紙nfds宸茬粡澶勭悊浜嗘墍鏈夋儏鍐碉級
+            return -1;
+            #endif
+        }
+        bool wakeup() noexcept {
+            #ifdef _WIN32
+            // Windows IOCP鍞ら啋 - 鎶曢€掕嚜瀹氫箟瀹屾垚
+            {
+                std::lock_guard<std::mutex> lock(wakeupMutex_);
+                // 妫€鏌ユ槸鍚︽鍦ㄦ竻鐞?                if (isCleaningUp_.load(std::memory_order_acquire)) {
+                    return true;
+                }
+                HANDLE handleToUse = iocpHandle_;
+                if (handleToUse != nullptr) {
+                    BOOL result = PostQueuedCompletionStatus(handleToUse, 0, 0, nullptr);
+                    if (!result) {
+                        DWORD error = GetLastError();
+                        // 濡傛灉鍙ユ焺鏃犳晥鐜囷紝鍙兘宸茶鍏抽棴锛岃繑鍥瀟rue
+                        if (error == ERROR_INVALID_HANDLE) {
+                            return true;
+                        }
+                        LOG_ERROR("PostQueuedCompletionStatus failed, error: " + std::to_string(error));
+                        return false;
+                    }
+                    return true;
+                }
+            }
+            // IOCP宸插叧闂紝鏃犻渶鍞ら啋
+            return true;
+            #else
+            // Linux鍐欏叆eventfd鍞ら啋epoll_wait
+            {
+                std::lock_guard<std::mutex> lock(wakeupMutex_);
+                // 妫€鏌ユ槸鍚︽鍦ㄦ竻鐞?                if (isCleaningUp_.load(std::memory_order_acquire)) {
+                    return true;
+                }
+                int fdToUse = eventFd_;
+                if (fdToUse < 0) {
+                    // epoll宸插叧闂紝鏃犻渶鍞ら啋
+                    return true;
+                }
+                uint64_t val = 1;
+                ssize_t written = ::write(fdToUse, &val, sizeof(val));
+                if (written != sizeof(val)) {
+                    // 鍐欏叆澶辫触锛岄€氬父鏄疎AGAIN鎴朎WOULDBLOCK锛屽彲浠ュ拷
+                    // 鍏朵粬閿欒璇存槑eventfd鍙兘宸插叧闂紝杩斿洖true
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        LOG_ERROR("eventfd write failed, errno: " + std::to_string(errno));
+                    }
+                }
+            }
+            return true;
+            #endif
+        }
+    private:
+        size_t maxEvents_;
+        // 鍞ら啋浜掓枼閿侊紙淇濊瘉鎶?wakeup() cleanup()
+        std::mutex wakeupMutex_;
+        // 娓呯悊鏍囧織锛堥槻姝㈠苟鍙戣皟cleanup
+        std::atomic<bool> isCleaningUp_;
+        // 鍏抽棴鏍囧織锛堥槻姝㈠湪 shutdown 鍚庤皟remove
+        std::atomic<bool> isShutdown_;
+        #ifdef _WIN32
+        // Windows IOCP鐗瑰畾鎴愬憳
+        // 鎵╁睍鐨凮VERLAPPED structure锛堝繀椤诲湪浣跨敤鍓嶅畾涔夛級
+        struct OverlappedEx {
+            OVERLAPPED overlapped;
+            socket_t fd;
+            EventType events;
+            std::vector<char> buffer;
+            std::atomic<bool> inUse;       // 鏍囪鏄惁姝ｅ湪浣跨敤锛堥槻姝㈤噸澶嶆姇閫掞級
+            std::atomic<bool> shouldRemove; // 鏍囪鏄惁闇€瑕佺Щ闄わ紙鐢ㄤ簬postReceive澶辫触鏃讹級
+            OverlappedEx() : overlapped{}, fd(INVALID_SOCKET_FD), events(EventType::None), inUse(false), shouldRemove(false) {
+                buffer.resize(DEFAULT_RECV_BUFFER_SIZE);
+            }
+        };
+        HANDLE iocpHandle_;
+        // overlappedPool_ 浜掓枼閿侊紙淇濊瘉鎶?Windows IOCP 鐨勯噸鍙犵粨鏋勬睜
+        std::mutex overlappedMutex_;
+        // 鍥炶皟鎵ц鏍囧織锛堥槻姝㈤噸鍏ワ級
+        std::atomic<bool> inCallback_{false};
+        // 寰呭垹闄ょ殑 OverlappedEx 闃熷垪锛堝欢杩熸瀽鏋勶紝閬垮厤 poll 绔炰簤鎬侊級
+        std::vector<std::unique_ptr<OverlappedEx>> pendingDelete_;
+        std::map<socket_t, std::unique_ptr<OverlappedEx>> overlappedPool_;
+        // 鎶曢€掑紓姝ユ帴鏀舵搷浣?        bool postReceive(socket_t fd) noexcept {
+            // 妫€鏌ユ槸鍚﹀凡鍏抽棴锛岄伩鍏嶆搷浣滃凡鍏抽棴鐨勫彞
+            if (isShutdown_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            std::lock_guard<std::mutex> lock(overlappedMutex_);
+            auto it = overlappedPool_.find(fd);
+            if (it == overlappedPool_.end()) {
+                return false;
+            }
+            OverlappedEx* pOverlapped = it->second.get();
+            // 妫€鏌ユ槸鍚﹀凡鏍囪涓洪渶瑕佺Щ
+            if (pOverlapped->shouldRemove.load(std::memory_order_acquire)) {
+                return false;
+            }
+            // 妫€socket 鏄惁鏈夋晥鐜?            if (pOverlapped->fd == INVALID_SOCKET_FD) {
+                return false;
+            }
+            // 妫€鏌ユ槸鍚﹀凡鍦ㄦ姇閫掍腑锛岄伩鍏嶉噸澶嶆姇
+            bool expected = false;
+            if (!pOverlapped->inUse.compare_exchange_strong(expected, true,
+                                                           std::memory_order_acq_rel,
+                                                           std::memory_order_acquire)) {
+                // 宸插湪鎶曢€掍腑锛屾棤闇€閲嶅鎶?                return true;
+            }
+            WSABUF wsaBuf;
+            wsaBuf.buf = pOverlapped->buffer.data();
+            wsaBuf.len = static_cast<ULONG>(pOverlapped->buffer.size());
+            DWORD flags = 0;
+            DWORD bytesRecv = 0;
+            int result = WSARecv(
+                fd,
+                &wsaBuf,
+                1,
+                &bytesRecv,
+                &flags,
+                &pOverlapped->overlapped,
+                nullptr
+            );
+            if (result == SOCKET_ERROR) {
+                int error = WSAGetLastError();
+                if (error != WSA_IO_PENDING) {
+                    // 鎶曢€掑け璐ワ紝閲嶇疆鏍囪
+                    pOverlapped->inUse.store(false, std::memory_order_release);
+                    // 鏍囪涓洪渶瑕佺Щ闄わ紝骞剁珛鍗充粠 overlappedPool_ 涓Щ闄わ紝閬垮厤鍐呭瓨娉勬紡
+                    pOverlapped->shouldRemove.store(true, std::memory_order_release);
+                    pOverlapped->fd = INVALID_SOCKET_FD;
+                    // 绉诲埌寰呭垹闄ゅ垪
+                    pendingDelete_.push_back(std::move(it->second));
+                    overlappedPool_.erase(it);
+                    LOG_ERROR("postReceive failed for fd " + std::to_string(fd) + ", error: " + std::to_string(error));
+                    return false;
+                }
+            }
+            return true;
+        }
+        #else
+        // Linux epoll鐗瑰畾鎴愬憳
+        int epollFd_;
+        int eventFd_;
+        std::vector<struct epoll_event> events_;
+        #endif
+    };
+    // EventPoller
+    EventPoller::EventPoller() noexcept
+        : impl_(std::make_unique<Impl>()), running_(false) {
+    }
+    // EventPoller鏋?    EventPoller::~EventPoller() noexcept {
+        shutdown();
+    }
+    // 杞鍣?    bool EventPoller::initialize(size_t maxEvents) {
+        if (running_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        if (!impl_->initialize(maxEvents)) {
+            return false;
+        }
+        // 鎴愬姛鑳藉悗鎵嶈缃繍琛屾爣
+        running_.store(true, std::memory_order_release);
+        return true;
+    }
+    // 鍏抽棴杞
+    void EventPoller::shutdown() noexcept {
+        // 浣跨敤 atomic compare_exchange 闃叉骞跺彂璋冪敤
+        // 娉ㄦ剰锛氬initialize() 鏈皟鐢ㄦ垨澶辫触锛宺unning_ ?false锛屾鏃剁洿鎺ヨ繑
+        bool expected = true;
+        if (!running_.compare_exchange_strong(expected, false,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {
+            return;  // 宸茬粡鍏抽棴鎴栦粠鏈繍
+        }
+        // 鍏堝敜閱掑彲鑳介樆濉炵殑 poll() 璋冪敤锛堝娆″敜閱掔‘淇濊瘉鍙潬鎬э級
+        // 澶氭鍞ら啋鏄洜wakeup() 鍙兘poll() 鍑嗗闃诲鍓嶈璋冪敤
+        for (int i = 0; i < WAKEUP_ATTEMPT_COUNT; ++i) {
+            wakeup();
+        }
+        // 绛夊緟鎵€poll 瀹屾垚
+        while (impl_->activePolls_.load(std::memory_order_acquire) > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        // 娓呯悊璧勬簮
+        impl_->cleanup();
+        // 娓呯悊绌轰簨浠舵槧灏?        std::unique_lock<std::shared_mutex> lock(mutex_);
+        eventMap_.clear();
+    }
+    // 娣诲姞Socket鍒拌疆璇㈠櫒
+    bool EventPoller::add(socket_t fd, EventType events, const EventCallback& callback, void* userData) noexcept {
+        if (!running_.load(std::memory_order_acquire) || fd == INVALID_SOCKET_FD) {
+            return false;
+        }
+        // 鍏堟坊鍔犲埌 eventMap锛屽啀璋冪敤 impl_->add
+        // 閬垮厤绔炰簤鎬侊細poll() 鍙兘impl_->add() ?eventMap_ 涔嬮棿鏀跺埌浜嬩欢
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            // 鍐嶆妫€鏌unning_鐘舵€侊紝闃叉鍦ㄥ姞閿佹湡闂磋shutdown
+            if (!running_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            // 妫€鏌ユ槸鍚﹀凡瀛樺湪
+            if (eventMap_.find(fd) != eventMap_.end()) {
+                return false;
+            }
+            EventData data;
+            data.fd = fd;
+            data.events = events;
+            data.callback = callback;
+            data.userData = userData;
+            eventMap_[fd] = data;
+        }
+        // 璋冪敤搴曞眰瀹炵幇娣诲姞IOCP/epoll
+        if (!impl_->add(fd, events)) {
+            // 搴曞眰娣诲姞澶辫触锛屼粠 eventMap 绉婚櫎
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            eventMap_.erase(fd);
+            // 瀵逛簬Windows IOCP锛宻ocket宸茬粡鍏宠仈鍒癐OCP锛岄渶瑕佽皟鐢╮emove()鏉ヨВ闄ゅ叧
+            // 瀵逛簬Linux epoll锛宻ocket宸茬粡涓嶅湪epoll涓紝涓嶉渶瑕侀澶栨搷浣?            // 杩欓噷缁熶竴璋冪敤remove()锛岃搴曞眰骞冲彴鑷澶勭悊
+            if (running_.load(std::memory_order_acquire)) {
+                impl_->remove(fd);
+            }
+            return false;
+        }
+        return true;
+    }
+    // 淇敼Socket鐩戝惉鐨勪簨
+    bool EventPoller::modify(socket_t fd, EventType events) noexcept {
+        if (!running_.load(std::memory_order_acquire) || fd == INVALID_SOCKET_FD) {
+            return false;
+        }
+        // 鍏堟fd 鏄惁瀛樺湪
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            auto it = eventMap_.find(fd);
+            if (it == eventMap_.end()) {
+                return false;
+            }
+        }
+        // 鍏堣皟impl_->modify锛屾垚鍔熻兘鍚庢墠鏇磂ventMap_
+        // 閬垮厤搴曞眰淇敼澶辫触eventMap_ 鐘舵€佷笉涓€
+        if (!impl_->modify(fd, events)) {
+            // 搴曞眰淇敼澶辫触锛屼粠 eventMap 绉婚櫎fd 浠ヤ繚鎸佷竴鑷?            // 杩欐牱鍙互閬垮厤 eventMap 涓瓨鍦ㄥ绔嬬殑 fd
+            {
+                std::unique_lock<std::shared_mutex> lock(mutex_);
+                eventMap_.erase(fd);
+            }
+            // 瀵逛簬Windows IOCP锛宻ocket宸茬粡鍏宠仈鍒癐OCP锛岄渶瑕佽皟鐢╮emove()鏉ヨВ闄ゅ叧
+            // 瀵逛簬Linux epoll锛宻ocket宸茬粡涓嶅湪epoll涓紝涓嶉渶瑕侀澶栨搷浣?            // 杩欓噷缁熶竴璋冪敤remove()锛岃搴曞眰骞冲彴鑷澶勭悊
+            if (running_.load(std::memory_order_acquire)) {
+                impl_->remove(fd);
+            }
+            return false;
+        }
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            auto it = eventMap_.find(fd);
+            // 娉ㄦ剰锛氳櫧鐒朵箣鍓嶆鏌ヨ繃 fd 瀛樺湪锛屼絾鍦ㄥ苟鍙戝満鏅笅鍙兘宸茶绉婚櫎
+            // 濡傛灉 fd 宸茶绉婚櫎锛屽氨涓嶆洿鏂帮紙杩欑鎯呭喌寰堝皯瑙侊級
+            if (it != eventMap_.end()) {
+                it->second.events = events;
+            }
+        }
+        return true;
+    }
+    // 浠庤疆璇㈠櫒绉婚櫎Socket
+    bool EventPoller::remove(socket_t fd) noexcept {
+        if (fd == INVALID_SOCKET_FD) {
+            return false;
+        }
+        // 鍦ㄩ攣鍐呮鏌ヨ繍琛岀姸鎬侊紝纭繚璇佷竴鑷?        bool isRunning;
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            eventMap_.erase(fd);
+            isRunning = running_.load(std::memory_order_acquire);
+        }
+        // 濡傛灉鏈嶅姟鏈繍琛岋紝浠庝簨浠舵槧灏勮〃绉婚櫎鍗冲彲
+        if (!isRunning) {
+            return true;
+        }
+        return impl_->remove(fd);
+    }
+    // 杞浜嬩欢
+    int EventPoller::poll(int timeoutMs) noexcept {
+        if (!running_.load(std::memory_order_acquire)) {
+            return -1;
+        }
+        // Impl::poll() 鍐呴儴浼氶€掑/閫掑噺 activePolls_锛屼繚璇佹姢鏁翠釜poll娴佺▼
+        // 鍖呮嫭绯荤粺璋冪敤鍜屽洖璋冩墽
+        int result = impl_->poll(timeoutMs, eventMap_, mutex_);
+        return result;
+    }
+    // 鍞ら啋杞
+    bool EventPoller::wakeup() noexcept {
+        return impl_->wakeup();
+    }
+    // 鑾峰彇鐩戝惉鐨凷ocket鏁伴噺
+    size_t EventPoller::getSocketCount() const noexcept {
+        // 鑾峰彇鍏变韩閿佸嵆鍙紝鍥犱负鏄彧璇绘搷浣?        std::shared_lock<std::shared_mutex> lock(mutex_);
+        return eventMap_.size();
+    }
+} // namespace FastNet
+
+                    cb.callback(cb.fd, cb.triggered, cb.data, cb.len);
+                    inCallback_.store(false, std::memory_order_release);
+                    // 妫€鏌ユ槸鍚﹀湪鍥炶皟鏈熼棿琚玸hutdown
+                    if (isShutdown_.load(std::memory_order_acquire)) {
+                        // 宸茬粡shutdown锛岃烦杩囧悗缁搷浣?                        continue;
+                    }
+                }
+            }
+            // 鍥炶皟鎵ц瀹屾垚鍚庯紝缁熶竴澶勭悊闇€瑕佸垹闄ょ殑fd鍜岄噸鏂版姇閫掓搷浣?            // 杩欐牱鍙互閬垮厤鍦ㄥ洖璋冩湡闂存寔鏈夐攣锛岄槻姝㈡
+            for (const auto& cb : callbacks) {
+                // 閲嶆柊妫€鏌ユ槸鍚﹀湪鍥炶皟鏈熼棿琚玸hutdown
+                if (isShutdown_.load(std::memory_order_acquire)) {
+                    break;
+                }
+                // 濡傛灉闇€瑕佺Щ闄ocket锛岃嚜鍔ㄤ粠 eventMap 绉婚櫎
+                if (cb.shouldRemove) {
+                    // 娉ㄦ剰锛歰verlappedPool_ 宸茬粡remove() 涓垹闄わ紝杩欓噷涓嶅啀閲嶅鍒犻櫎
+                    std::unique_lock<std::shared_mutex> lock(mutex);
+                    eventMap.erase(cb.fd);
+                }
+                // 閲嶆柊鎶曢€掓帴鏀舵搷浣滐紙浠呭湪闇€瑕佷笖socket鏈绉婚櫎鏃讹級
+                if (cb.needPostReceive && !cb.shouldRemove) {
+                    postReceive(cb.fd);
+                }
+            }
+            // 娓呯悊寰呭垹闄ょ殑 OverlappedEx锛堝湪鍥炶皟鎵ц鍚庯級
+            // 鍙竻鐞咺O宸插畬鎴愮殑瀵硅薄锛岄伩鍏嶉噴鏀炬鍦↖O涓殑鍐呭瓨
+            // 濡傛灉pendingDelete_澶ぇ锛屽己鍒舵竻鐞嗕互闃叉鍐呭瓨娉勬紡
+            {
+                std::lock_guard<std::mutex> lock(overlappedMutex_);
+                size_t sizeBefore = pendingDelete_.size();
+                auto it = std::remove_if(pendingDelete_.begin(), pendingDelete_.end(),
+                    [](const auto& overlapped) {
+                        return !overlapped->inUse.load(std::memory_order_acquire);
+                    });
+                size_t removed = std::distance(it, pendingDelete_.end());
+                pendingDelete_.erase(it, pendingDelete_.end());
+                if (removed > 0 && sizeBefore > PENDING_DELETE_THRESHOLD) {
+                    LOG_DEBUG("Cleaned " + std::to_string(removed) + " completed OverlappedEx from pendingDelete_ (" + std::to_string(pendingDelete_.size()) + " remaining)");
+                }
+            }
+            // 閫掑噺娲诲姩poll璁℃暟锛堝湪鍥炶皟鎵ц瀹屾垚鍚庯級
+            // 娉ㄦ剰锛氬繀椤诲湪鎵€鏈夊洖璋冨拰娓呯悊瀹屾垚鍚庢墠閫掑噺锛屽惁鍒檆leanup()鍙兘鍦ㄥ洖璋冧粛鍦ㄦ墽琛屾椂鍏抽棴鍙ユ焺
+            activePolls_.fetch_sub(1, std::memory_order_acq_rel);

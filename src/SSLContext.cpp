@@ -181,6 +181,16 @@ SSL* SSLContext::createHandle() const {
         SSL_set_accept_state(ssl);
     } else {
         SSL_set_connect_state(ssl);
+
+        // Always set SNI (Server Name Indication) for non-IP hostnames.
+        // SNI is required by CDN providers (e.g. Cloudflare) that host multiple
+        // domains on the same IP. This is independent of certificate verification.
+        if (!sslConfig_.hostnameVerification.empty() &&
+            !Address::isValidIPv4(sslConfig_.hostnameVerification) &&
+            !Address::isValidIPv6(sslConfig_.hostnameVerification)) {
+            SSL_set_tlsext_host_name(ssl, sslConfig_.hostnameVerification.c_str());
+        }
+
         if (sslConfig_.verifyPeer && !sslConfig_.hostnameVerification.empty()) {
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L
             if (Address::isValidIPv4(sslConfig_.hostnameVerification)) {

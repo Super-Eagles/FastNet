@@ -10,15 +10,111 @@
 #include "TcpServer.h"
 #include "Timer.h"
 #include "WebSocketProtocol.h"
+#include "base64.h"
 
 #include <algorithm>
 #include <cctype>
+#include <map>
 #include <mutex>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 namespace FastNet {
+
+namespace {
+
+void appendHeaderLine(std::string& output, std::string_view name, std::string_view value) {
+    output.append(name.data(), name.size());
+    output.append(": ", 2);
+    output.append(value.data(), value.size());
+    output.append("\r\n", 2);
+}
+
+bool isReservedHandshakeResponseHeader(std::string_view name) {
+    return HttpParser::caseInsensitiveCompare(name, "Upgrade") ||
+           HttpParser::caseInsensitiveCompare(name, "Connection") ||
+           HttpParser::caseInsensitiveCompare(name, "Sec-WebSocket-Accept") ||
+           HttpParser::caseInsensitiveCompare(name, "Sec-WebSocket-Protocol") ||
+           HttpParser::caseInsensitiveCompare(name, "Content-Length");
+}
+
+std::vector<std::string> splitSubprotocols(std::string_view value) {
+    std::vector<std::string> protocols;
+    size_t offset = 0;
+    while (offset <= value.size()) {
+        const size_t comma = value.find(',', offset);
+        const std::string_view current =
+            comma == std::string_view::npos ? value.substr(offset) : value.substr(offset, comma - offset);
+        const std::string_view trimmed = HttpParser::trim(current);
+        if (!trimmed.empty()) {
+            protocols.emplace_back(trimmed);
+        }
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        offset = comma + 1;
+    }
+    return protocols;
+}
+
+bool containsSubprotocol(const std::vector<std::string>& protocols, std::string_view candidate) {
+    candidate = HttpParser::trim(candidate);
+    return std::any_of(protocols.begin(), protocols.end(), [candidate](const std::string& protocol) {
+        return HttpParser::caseInsensitiveCompare(protocol, candidate);
+    });
+}
+
+bool isValidWebSocketKey(std::string_view key) {
+    Buffer decoded;
+    return tryBase64Decode(HttpParser::trim(key), decoded) && decoded.size() == 16;
+}
+
+std::string selectSubprotocol(const std::vector<std::string>& serverProtocols,
+                              const std::vector<std::string>& clientProtocols) {
+    for (const auto& serverProtocol : serverProtocols) {
+        if (containsSubprotocol(clientProtocols, serverProtocol)) {
+            return serverProtocol;
+        }
+    }
+    return {};
+}
+
+std::string buildHandshakeResponse(std::string_view key,
+                                   const WebSocketServerHandshakeResponse& handshakeResponse) {
+    std::string response;
+    response.reserve(256);
+    response += "HTTP/1.1 101 Switching Protocols\r\n";
+    response += "Upgrade: websocket\r\n";
+    response += "Connection: Upgrade\r\n";
+    response += "Sec-WebSocket-Accept: ";
+    response += WebSocketProtocol::createAcceptKey(key);
+    response += "\r\n";
+    if (!handshakeResponse.acceptedSubprotocol.empty()) {
+        appendHeaderLine(response, "Sec-WebSocket-Protocol", handshakeResponse.acceptedSubprotocol);
+    }
+    for (const auto& [name, value] : handshakeResponse.headers) {
+        if (!isReservedHandshakeResponseHeader(name)) {
+            appendHeaderLine(response, name, value);
+        }
+    }
+    response += "\r\n";
+    return response;
+}
+
+std::string buildHandshakeRejection(const WebSocketServerHandshakeResponse& handshakeResponse) {
+    const int statusCode = handshakeResponse.rejectStatusCode <= 0 ? 403 : handshakeResponse.rejectStatusCode;
+    const std::string statusMessage =
+        handshakeResponse.rejectStatusMessage.empty() ? "Forbidden" : handshakeResponse.rejectStatusMessage;
+    const std::string body = handshakeResponse.rejectBody;
+    std::map<std::string, std::string> headers = handshakeResponse.headers;
+    headers["Connection"] = "close";
+    headers["Content-Type"] = "text/plain; charset=utf-8";
+    headers["Content-Length"] = std::to_string(body.size());
+    return HttpParser::buildResponse(statusCode, statusMessage, headers, body);
+}
+
+} // namespace
 
 class WebSocketServer::Impl : public std::enable_shared_from_this<WebSocketServer::Impl> {
 public:
@@ -118,6 +214,17 @@ public:
     size_t getClientCount() const { return tcpServer_.getClientCount(); }
     std::vector<ConnectionId> getClientIds() const { return tcpServer_.getClientIds(); }
     Address getClientAddress(ConnectionId clientId) const { return tcpServer_.getClientAddress(clientId); }
+    std::optional<std::string> getClientSubprotocol(ConnectionId clientId) const {
+        std::lock_guard<std::mutex> lock(clientStatesMutex_);
+        auto it = clientStates_.find(clientId);
+        if (it == clientStates_.end() || it->second.subprotocol.empty()) {
+            return std::nullopt;
+        }
+        return it->second.subprotocol;
+    }
+    void setHandshakeCallback(const WebSocketServerHandshakeCallback& callback) { handshakeCallback_ = callback; }
+    void setHandshakeResponseHeaders(const WebSocketServerHeaders& headers) { handshakeResponseHeaders_ = headers; }
+    void setSubprotocols(const std::vector<std::string>& subprotocols) { subprotocols_ = subprotocols; }
     void setClientConnectedCallback(const WebSocketServerClientConnectedCallback& callback) { clientConnectedCallback_ = callback; }
     void setClientDisconnectedCallback(const WebSocketServerClientDisconnectedCallback& callback) { clientDisconnectedCallback_ = callback; }
     void setMessageCallback(const WebSocketServerMessageCallback& callback) { messageCallback_ = callback; }
@@ -187,6 +294,7 @@ private:
         Buffer buffer;
         size_t bufferOffset = 0;
         Address clientAddress;
+        std::string subprotocol;
         uint64_t lastActivity = 0;
     };
 
@@ -265,6 +373,7 @@ private:
         std::string connectionValue;
         std::string keyValue;
         std::string versionValue;
+        WebSocketServerHandshakeRequest handshakeRequest;
         size_t consumedBytes = 0;
         {
             std::lock_guard<std::mutex> lock(clientStatesMutex_);
@@ -289,6 +398,13 @@ private:
                 const auto connection = requestView.getHeader("Connection");
                 const auto key = requestView.getHeader("Sec-WebSocket-Key");
                 const auto version = requestView.getHeader("Sec-WebSocket-Version");
+                handshakeRequest.target.assign(requestView.target.begin(), requestView.target.end());
+                handshakeRequest.path.assign(requestView.uri.begin(), requestView.uri.end());
+                handshakeRequest.queryString.assign(requestView.queryString.begin(), requestView.queryString.end());
+                handshakeRequest.clientAddress = clientAddress;
+                for (const auto& [name, value] : requestView.headers) {
+                    handshakeRequest.headers[std::string(name)] = std::string(value);
+                }
                 if (upgrade.has_value()) {
                     upgradeValue.assign(upgrade->begin(), upgrade->end());
                 }
@@ -300,6 +416,9 @@ private:
                 }
                 if (version.has_value()) {
                     versionValue.assign(version->begin(), version->end());
+                }
+                if (const auto protocols = requestView.getHeader("Sec-WebSocket-Protocol")) {
+                    handshakeRequest.requestedSubprotocols = splitSubprotocols(*protocols);
                 }
             }
         }
@@ -316,14 +435,43 @@ private:
             versionValue.empty() ||
             !HttpParser::caseInsensitiveCompare(upgradeValue, "websocket") ||
             !containsToken(connectionValue, "upgrade") ||
+            !isValidWebSocketKey(keyValue) ||
             versionValue != "13") {
             handleError(ErrorCode::WebSocketHandshakeError, "Unsupported WebSocket handshake");
             disconnectClient(clientId, 1002, "Protocol error");
             return;
         }
 
+        WebSocketServerHandshakeResponse handshakeResponse;
+        handshakeResponse.headers = handshakeResponseHeaders_;
+        handshakeResponse.acceptedSubprotocol =
+            selectSubprotocol(subprotocols_, handshakeRequest.requestedSubprotocols);
+        if (handshakeCallback_) {
+            handshakeCallback_(clientId, handshakeRequest, handshakeResponse);
+        }
+        if (!handshakeResponse.acceptedSubprotocol.empty() &&
+            !containsSubprotocol(handshakeRequest.requestedSubprotocols, handshakeResponse.acceptedSubprotocol)) {
+            handshakeResponse.accept = false;
+            handshakeResponse.rejectStatusCode = 400;
+            handshakeResponse.rejectStatusMessage = "Bad Request";
+            handshakeResponse.rejectBody = "Selected WebSocket subprotocol was not requested by the client";
+        }
+
+        if (!handshakeResponse.accept) {
+            std::string rejection = buildHandshakeRejection(handshakeResponse);
+            const size_t rejectionSize = rejection.size();
+            const Error sendResult = tcpServer_.sendToClient(clientId, std::move(rejection));
+            if (sendResult.isFailure()) {
+                handleError(ErrorCode::WebSocketConnectionError, "Failed to send handshake rejection");
+            } else {
+                getPerformanceMonitor().incrementMetric("bytes.sent", rejectionSize);
+            }
+            tcpServer_.closeClientAfterPendingWrites(clientId);
+            return;
+        }
+
         const uint64_t timerId = getPerformanceMonitor().startTimer();
-        std::string response = WebSocketProtocol::createHandshakeResponse(keyValue);
+        std::string response = buildHandshakeResponse(keyValue, handshakeResponse);
         const size_t responseSize = response.size();
         if (!tcpServer_.sendToClient(clientId, std::move(response)).isSuccess()) {
             handleError(ErrorCode::WebSocketConnectionError, "Failed to send handshake response");
@@ -341,6 +489,7 @@ private:
                 return;
             }
             it->second.status = ClientState::Status::Connected;
+            it->second.subprotocol = handshakeResponse.acceptedSubprotocol;
             it->second.bufferOffset += consumedBytes;
             compactBufferedStateLocked(it->second);
             hasRemaining = !makeBufferedView(it->second).empty();
@@ -378,7 +527,9 @@ private:
                     }
 
                     invalidFrame =
-                        !WebSocketProtocol::decodeFrame(pending.substr(0, frameSize), payload, metadata) || !metadata.final;
+                        !WebSocketProtocol::decodeFrame(pending.substr(0, frameSize), payload, metadata) ||
+                        !metadata.final ||
+                        !metadata.masked;
                     if (!invalidFrame) {
                         it->second.bufferOffset += frameSize;
                         compactBufferedStateLocked(it->second);
@@ -667,6 +818,9 @@ private:
     WebSocketServerBinaryCallback binaryCallback_;
     WebSocketServerBinaryOwnedCallback ownedBinaryCallback_;
     WebSocketServerErrorCallback serverErrorCallback_;
+    WebSocketServerHandshakeCallback handshakeCallback_;
+    WebSocketServerHeaders handshakeResponseHeaders_;
+    std::vector<std::string> subprotocols_;
 };
 
 WebSocketServer::WebSocketServer(IoService& ioService)
@@ -714,6 +868,22 @@ std::vector<ConnectionId> WebSocketServer::getClientIds() const {
 
 Address WebSocketServer::getClientAddress(ConnectionId clientId) const {
     return impl_->getClientAddress(clientId);
+}
+
+std::optional<std::string> WebSocketServer::getClientSubprotocol(ConnectionId clientId) const {
+    return impl_->getClientSubprotocol(clientId);
+}
+
+void WebSocketServer::setHandshakeCallback(const WebSocketServerHandshakeCallback& callback) {
+    impl_->setHandshakeCallback(callback);
+}
+
+void WebSocketServer::setHandshakeResponseHeaders(const WebSocketServerHeaders& headers) {
+    impl_->setHandshakeResponseHeaders(headers);
+}
+
+void WebSocketServer::setSubprotocols(const std::vector<std::string>& subprotocols) {
+    impl_->setSubprotocols(subprotocols);
 }
 
 void WebSocketServer::setClientConnectedCallback(const WebSocketServerClientConnectedCallback& callback) {

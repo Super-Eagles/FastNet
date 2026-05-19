@@ -12,6 +12,11 @@ set "BUILD_RELEASE=1"
 set "BUILD_DEBUG=1"
 set "CLEAN_FIRST=0"
 set "EXTRA_CMAKE_ARGS="
+set "CMAKE_EXE=cmake"
+set "OPENSSL_CMAKE_ARGS="
+set "DETECTED_OPENSSL_ROOT="
+set "DETECTED_OPENSSL_SSL_LIBRARY="
+set "DETECTED_OPENSSL_CRYPTO_LIBRARY="
 
 :parse_args
 if "%~1"=="" goto after_parse
@@ -48,23 +53,25 @@ if /I "%~1"=="--debug-only" (
     shift
     goto parse_args
 )
- if /I "%~1"=="--build-dir" (
-     shift
-     if "%~1"=="" goto invalid_args
-     set "BUILD_DIR=%~1"
-     if "!BUILD_DIR:~-1!"=="\" set "BUILD_DIR=!BUILD_DIR:~0,-1!"
-     shift
-     goto parse_args
- )
-if /I "%~1"=="--generator" (
-    shift
-    if "%~1"=="" goto invalid_args
-    set "CMAKE_GENERATOR=%~1"
-    shift
-    goto parse_args
-)
+if /I "%~1"=="--build-dir" goto parse_build_dir
+if /I "%~1"=="--generator" goto parse_generator
 
 set "EXTRA_CMAKE_ARGS=!EXTRA_CMAKE_ARGS! %~1"
+shift
+goto parse_args
+
+:parse_build_dir
+shift
+if "%~1"=="" goto invalid_args
+set "BUILD_DIR=%~1"
+if "!BUILD_DIR:~-1!"=="\" set "BUILD_DIR=!BUILD_DIR:~0,-1!"
+shift
+goto parse_args
+
+:parse_generator
+shift
+if "%~1"=="" goto invalid_args
+set "CMAKE_GENERATOR=%~1"
 shift
 goto parse_args
 
@@ -83,6 +90,14 @@ if not defined CMAKE_GENERATOR (
     if errorlevel 1 exit /b 1
 )
 
+call :detect_cmake
+if errorlevel 1 exit /b 1
+
+if /I "%FASTNET_ENABLE_SSL%"=="ON" (
+    call :detect_openssl
+    if defined DETECTED_OPENSSL_ROOT echo OpenSSL     : !DETECTED_OPENSSL_ROOT!
+)
+
 if "%CLEAN_FIRST%"=="1" if exist "%BUILD_DIR%" (
     echo [1/5] Removing existing build directory...
     rmdir /s /q "%BUILD_DIR%"
@@ -94,7 +109,8 @@ if not exist "%BUILD_DIR%" (
 )
 
 echo [3/5] Configuring CMake...
-cmake -S "%PROJECT_DIR%" -B "%BUILD_DIR%" -G "%CMAKE_GENERATOR%" -A x64 -DFASTNET_ENABLE_SSL=%FASTNET_ENABLE_SSL% -DFASTNET_BUILD_EXAMPLES=%FASTNET_BUILD_EXAMPLES% -DFASTNET_BUILD_TESTS=%FASTNET_BUILD_TESTS% %EXTRA_CMAKE_ARGS%
+set "VcpkgEnabled=false"
+"%CMAKE_EXE%" -S "%PROJECT_DIR%" -B "%BUILD_DIR%" -G "%CMAKE_GENERATOR%" -A x64 -DFASTNET_ENABLE_SSL=%FASTNET_ENABLE_SSL% -DFASTNET_BUILD_EXAMPLES=%FASTNET_BUILD_EXAMPLES% -DFASTNET_BUILD_TESTS=%FASTNET_BUILD_TESTS% %OPENSSL_CMAKE_ARGS% %EXTRA_CMAKE_ARGS%
 if errorlevel 1 (
     echo [ERROR] CMake configuration failed.
     exit /b 1
@@ -102,7 +118,7 @@ if errorlevel 1 (
 
 if "%BUILD_RELEASE%"=="1" (
     echo [4/5] Building Release...
-    cmake --build "%BUILD_DIR%" --config Release
+    "%CMAKE_EXE%" --build "%BUILD_DIR%" --config Release
     if errorlevel 1 (
         echo [ERROR] Release build failed.
         exit /b 1
@@ -111,7 +127,7 @@ if "%BUILD_RELEASE%"=="1" (
 
 if "%BUILD_DEBUG%"=="1" (
     echo [5/5] Building Debug...
-    cmake --build "%BUILD_DIR%" --config Debug
+    "%CMAKE_EXE%" --build "%BUILD_DIR%" --config Debug
     if errorlevel 1 (
         echo [ERROR] Debug build failed.
         exit /b 1
@@ -122,9 +138,77 @@ echo ========================================
 echo   Build completed successfully
 echo ========================================
 echo Generator   : %CMAKE_GENERATOR%
+echo CMake       : %CMAKE_EXE%
 echo Build dir   : %BUILD_DIR%
 echo Library dir : %PROJECT_DIR%\lib
 echo Runtime dir : %PROJECT_DIR%\bin
+exit /b 0
+
+:detect_cmake
+where cmake >nul 2>nul
+if not errorlevel 1 (
+    set "CMAKE_EXE=cmake"
+    exit /b 0
+)
+
+call :try_cmake "C:\Program Files\CMake\bin\cmake.exe"
+if defined CMAKE_FOUND exit /b 0
+call :try_cmake "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+if defined CMAKE_FOUND exit /b 0
+call :try_cmake "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+if defined CMAKE_FOUND exit /b 0
+call :try_cmake "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+if defined CMAKE_FOUND exit /b 0
+call :try_cmake "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+if defined CMAKE_FOUND exit /b 0
+
+echo [ERROR] CMake executable not found.
+echo         Install CMake or add Visual Studio CMake tools to PATH.
+exit /b 1
+
+:try_cmake
+if not exist "%~1" exit /b 0
+set "CMAKE_EXE=%~1"
+set "CMAKE_FOUND=1"
+exit /b 0
+
+:detect_openssl
+if defined OPENSSL_ROOT_DIR call :try_openssl_root "%OPENSSL_ROOT_DIR%"
+if defined DETECTED_OPENSSL_ROOT goto openssl_detected
+call :try_openssl_root "D:\program\OpenSSL-Win64"
+if defined DETECTED_OPENSSL_ROOT goto openssl_detected
+call :try_openssl_root "C:\Program Files\OpenSSL-Win64"
+if defined DETECTED_OPENSSL_ROOT goto openssl_detected
+call :try_openssl_root "C:\Program Files\OpenSSL"
+if defined DETECTED_OPENSSL_ROOT goto openssl_detected
+echo [WARN] OpenSSL was requested, but no common Windows OpenSSL install was found.
+echo        Pass -DOPENSSL_ROOT_DIR=... as an extra CMake argument if needed.
+exit /b 0
+
+:openssl_detected
+set "OPENSSL_CMAKE_ARGS="-DOPENSSL_ROOT_DIR:PATH=%DETECTED_OPENSSL_ROOT%" "-DOPENSSL_INCLUDE_DIR:PATH=%DETECTED_OPENSSL_ROOT%\include""
+set "OPENSSL_CMAKE_ARGS=%OPENSSL_CMAKE_ARGS% "-DOPENSSL_SSL_LIBRARY:FILEPATH=%DETECTED_OPENSSL_SSL_LIBRARY%" "-DOPENSSL_CRYPTO_LIBRARY:FILEPATH=%DETECTED_OPENSSL_CRYPTO_LIBRARY%""
+set "OPENSSL_CMAKE_ARGS=%OPENSSL_CMAKE_ARGS% "-DSSL_EAY_RELEASE:FILEPATH=%DETECTED_OPENSSL_SSL_LIBRARY%" "-DLIB_EAY_RELEASE:FILEPATH=%DETECTED_OPENSSL_CRYPTO_LIBRARY%""
+set "OPENSSL_CMAKE_ARGS=%OPENSSL_CMAKE_ARGS% "-DSSL_EAY_LIBRARY_RELEASE:FILEPATH=%DETECTED_OPENSSL_SSL_LIBRARY%" "-DLIB_EAY_LIBRARY_RELEASE:FILEPATH=%DETECTED_OPENSSL_CRYPTO_LIBRARY%""
+exit /b 0
+
+:try_openssl_root
+if "%~1"=="" exit /b 0
+set "OPENSSL_CANDIDATE=%~1"
+if not exist "%OPENSSL_CANDIDATE%\include\openssl\ssl.h" exit /b 0
+call :try_openssl_libraries "%OPENSSL_CANDIDATE%\lib\VC\x64\MD\libssl.lib" "%OPENSSL_CANDIDATE%\lib\VC\x64\MD\libcrypto.lib"
+if defined DETECTED_OPENSSL_ROOT exit /b 0
+call :try_openssl_libraries "%OPENSSL_CANDIDATE%\lib\libssl.lib" "%OPENSSL_CANDIDATE%\lib\libcrypto.lib"
+if defined DETECTED_OPENSSL_ROOT exit /b 0
+call :try_openssl_libraries "%OPENSSL_CANDIDATE%\lib64\libssl.lib" "%OPENSSL_CANDIDATE%\lib64\libcrypto.lib"
+exit /b 0
+
+:try_openssl_libraries
+if exist "%~1" if exist "%~2" (
+    set "DETECTED_OPENSSL_ROOT=%OPENSSL_CANDIDATE%"
+    set "DETECTED_OPENSSL_SSL_LIBRARY=%~1"
+    set "DETECTED_OPENSSL_CRYPTO_LIBRARY=%~2"
+)
 exit /b 0
 
 :detect_visual_studio

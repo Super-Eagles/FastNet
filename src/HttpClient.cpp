@@ -12,7 +12,10 @@
 #include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <cstddef>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -150,7 +153,7 @@ std::string buildClientRequest(std::string_view method,
                                std::string_view hostHeader,
                                bool useCompression) {
     const RequestHeaderState state = scanRequestHeaders(headers);
-    const bool addContentLength = !state.hasContentLength && (!state.hasTransferEncoding || !body.empty());
+    const bool addContentLength = !state.hasContentLength && !state.hasTransferEncoding;
     const bool advertiseCompression = useCompression && supportsCompressedResponseDecoding();
 
     size_t reserveBytes = method.size() + path.size() + body.size() + state.serializedBytes + 16;
@@ -341,6 +344,110 @@ std::string joinRelativePath(std::string_view basePath, std::string_view relativ
 
 } // namespace
 
+HttpClientRequest::HttpClientRequest(std::string path)
+    : path_(path.empty() ? "/" : std::move(path)) {}
+
+HttpClientRequest& HttpClientRequest::setMethod(std::string method) {
+    method_ = std::move(method);
+    return *this;
+}
+
+HttpClientRequest& HttpClientRequest::setPath(std::string path) {
+    path_ = path.empty() ? "/" : std::move(path);
+    return *this;
+}
+
+HttpClientRequest& HttpClientRequest::addHeader(std::string name, std::string value) {
+    headers_[std::move(name)] = std::move(value);
+    return *this;
+}
+
+HttpClientRequest& HttpClientRequest::addQuery(std::string name, std::string value) {
+    const char separator = path_.find('?') == std::string::npos ? '?' : '&';
+    path_.push_back(separator);
+    path_ += HttpParser::urlEncode(name);
+    path_.push_back('=');
+    path_ += HttpParser::urlEncode(value);
+    return *this;
+}
+
+HttpClientRequest& HttpClientRequest::setBody(std::string body) {
+    body_ = std::move(body);
+    return *this;
+}
+
+HttpClientRequest& HttpClientRequest::setJson(std::string json) {
+    eraseHeaderCaseInsensitive(headers_, "Content-Type");
+    headers_["Content-Type"] = "application/json";
+    body_ = std::move(json);
+    return *this;
+}
+
+HttpClientRequest& HttpClientRequest::setForm(const std::map<std::string, std::string>& values) {
+    eraseHeaderCaseInsensitive(headers_, "Content-Type");
+    headers_["Content-Type"] = "application/x-www-form-urlencoded";
+    body_.clear();
+    for (const auto& [name, value] : values) {
+        if (!body_.empty()) {
+            body_.push_back('&');
+        }
+        body_ += HttpParser::urlEncode(name);
+        body_.push_back('=');
+        body_ += HttpParser::urlEncode(value);
+    }
+    return *this;
+}
+
+HttpClientRequest& HttpClientRequest::setBearerToken(std::string token) {
+    eraseHeaderCaseInsensitive(headers_, "Authorization");
+    headers_["Authorization"] = "Bearer " + token;
+    return *this;
+}
+
+HttpClientRequest& HttpClientRequest::setBasicAuth(std::string username, std::string password) {
+    eraseHeaderCaseInsensitive(headers_, "Authorization");
+    headers_["Authorization"] = "Basic " + base64Encode(username + ":" + password);
+    return *this;
+}
+
+HttpClientRequest& HttpClientRequest::setUserAgent(std::string userAgent) {
+    eraseHeaderCaseInsensitive(headers_, "User-Agent");
+    headers_["User-Agent"] = std::move(userAgent);
+    return *this;
+}
+
+HttpClientRequest& HttpClientRequest::setAccept(std::string accept) {
+    eraseHeaderCaseInsensitive(headers_, "Accept");
+    headers_["Accept"] = std::move(accept);
+    return *this;
+}
+
+HttpClientRequest& HttpClientRequest::setTimeout(std::chrono::milliseconds timeout) {
+    const auto count = timeout.count();
+    timeoutMs_ = count <= 0 ? 0 : static_cast<uint32_t>(std::min<int64_t>(count, (std::numeric_limits<uint32_t>::max)()));
+    return *this;
+}
+
+const std::string& HttpClientRequest::method() const noexcept {
+    return method_;
+}
+
+const std::string& HttpClientRequest::path() const noexcept {
+    return path_;
+}
+
+const RequestHeaders& HttpClientRequest::headers() const noexcept {
+    return headers_;
+}
+
+const std::string& HttpClientRequest::body() const noexcept {
+    return body_;
+}
+
+uint32_t HttpClientRequest::timeoutMs() const noexcept {
+    return timeoutMs_;
+}
+
 class HttpClient::Impl : public std::enable_shared_from_this<HttpClient::Impl> {
 public:
     explicit Impl(IoService& ioService)
@@ -410,11 +517,66 @@ public:
         return sendRequest(method, path, headers, body, callback);
     }
 
+    bool request(const HttpClientRequest& request, const HttpClientResponseCallback& callback) {
+        return sendRequestObject(request, callback);
+    }
+
+    bool streamRequest(std::string_view method,
+                       std::string_view path,
+                       const RequestHeaders& headers,
+                       std::string_view body,
+                       const HttpClientStreamHeadersCallback& headersCallback,
+                       const HttpClientStreamDataCallback& dataCallback,
+                       const HttpClientStreamCompleteCallback& completeCallback) {
+        return sendStreamingRequest(method, path, headers, body, headersCallback, dataCallback, completeCallback);
+    }
+
+    bool streamGet(const std::string& path,
+                   const RequestHeaders& headers,
+                   const HttpClientStreamHeadersCallback& headersCallback,
+                   const HttpClientStreamDataCallback& dataCallback,
+                   const HttpClientStreamCompleteCallback& completeCallback) {
+        return sendStreamingRequest("GET", path, headers, "", headersCallback, dataCallback, completeCallback);
+    }
+
+    bool streamRequest(const HttpClientRequest& request,
+                       const HttpClientStreamHeadersCallback& headersCallback,
+                       const HttpClientStreamDataCallback& dataCallback,
+                       const HttpClientStreamCompleteCallback& completeCallback) {
+        return sendStreamingRequestObject(request, headersCallback, dataCallback, completeCallback);
+    }
+
+    void cancelRequest() {
+        if (!awaitingResponse_) {
+            return;
+        }
+
+        setLastError(ErrorCode::ConnectionError, "HTTP request cancelled");
+        stopRequestTimer();
+        restoreRequestTimeoutOverride();
+        awaitingResponse_ = false;
+        responseBuffer_.clear();
+        tcpClient_.disconnect();
+
+        if (streamingResponse_) {
+            completeStreamingWithStatus(0, "HTTP request cancelled");
+            return;
+        }
+
+        if (responseCallback_) {
+            HttpResponse response;
+            response.statusCode = 0;
+            response.statusMessage = "HTTP request cancelled";
+            responseCallback_(response);
+        }
+    }
+
     void disconnect() {
         stopRequestTimer();
         tcpClient_.disconnect();
         connected_ = false;
         awaitingResponse_ = false;
+        streamingResponse_ = false;
         responseBuffer_.clear();
     }
 
@@ -446,6 +608,24 @@ public:
 
     void setSSLConfig(const SSLConfig& sslConfig) {
         sslConfig_ = sslConfig;
+    }
+
+    bool setProxyUrl(std::string_view proxyUrl) {
+        HttpProxyOptions parsedProxy;
+        if (!parseProxyUrl(proxyUrl, parsedProxy)) {
+            setLastError(ErrorCode::InvalidArgument, "Invalid HTTP proxy URL");
+            return false;
+        }
+        setProxy(parsedProxy);
+        return true;
+    }
+
+    void setProxy(const HttpProxyOptions& proxyOptions) {
+        proxyOptions_ = proxyOptions;
+    }
+
+    void clearProxy() {
+        proxyOptions_ = {};
     }
 
     bool isConnected() const {
@@ -524,12 +704,24 @@ private:
         replayAfterConnect_ = replayRequest;
         responseBuffer_.clear();
         connected_ = false;
+
+        if (shouldUseHttpProxy() && parsedUrl_.protocol == "https") {
+            const std::string message = "HTTPS proxy tunneling is not supported by HttpClient yet";
+            setLastError(ErrorCode::InvalidArgument, message);
+            if (connectCallback_) {
+                connectCallback_(false, message);
+            }
+            return false;
+        }
+
         const SSLConfig effectiveSslConfig = buildEffectiveSslConfig();
+        const std::string connectHost = shouldUseHttpProxy() ? proxyOptions_.host : parsedUrl_.host;
+        const uint16_t connectPort = shouldUseHttpProxy() ? proxyOptions_.port : parsedUrl_.port;
 
         std::weak_ptr<Impl> weakSelf = shared_from_this();
         const bool started = tcpClient_.connect(
-            parsedUrl_.host,
-            parsedUrl_.port,
+            connectHost,
+            connectPort,
             [weakSelf](bool success, const std::string& message) {
                 auto self = weakSelf.lock();
                 if (!self) {
@@ -591,6 +783,11 @@ private:
             responseBuffer_.insert(responseBuffer_.end(), data.begin(), data.end());
         }
 
+        if (streamingResponse_) {
+            handleStreamingDataReceived(false);
+            return;
+        }
+
         HttpResponse response;
         if (!tryConsumeBufferedResponse(false, response)) {
             return;
@@ -605,6 +802,14 @@ private:
         connected_ = false;
         if (awaitingResponse_ && !reason.empty()) {
             setLastError(ErrorCode::ConnectionError, reason);
+        }
+
+        if (awaitingResponse_ && streamingResponse_) {
+            handleStreamingDataReceived(true);
+            if (awaitingResponse_) {
+                completeStreamingWithStatus(0, reason.empty() ? "Connection closed" : reason);
+            }
+            return;
         }
 
         if (awaitingResponse_ && !responseBuffer_.empty()) {
@@ -629,6 +834,11 @@ private:
     void handleError(ErrorCode code, const std::string& message) {
         setLastError(code, message);
         stopRequestTimer();
+        if (streamingResponse_) {
+            completeStreamingWithStatus(0, message);
+            return;
+        }
+        restoreRequestTimeoutOverride();
         if (responseCallback_) {
             HttpResponse response;
             response.statusCode = 0;
@@ -666,15 +876,94 @@ private:
         return sendPendingRequest();
     }
 
+    bool sendRequestObject(const HttpClientRequest& request, const HttpClientResponseCallback& callback) {
+        const uint32_t previousTimeout = requestTimeout_;
+        if (request.timeoutMs() != 0) {
+            requestTimeout_ = request.timeoutMs();
+        }
+        const bool result = sendRequest(request.method(), request.path(), request.headers(), request.body(), callback);
+        if (!result || request.timeoutMs() == 0) {
+            requestTimeout_ = previousTimeout;
+        } else {
+            pendingRequestOverrideTimeout_ = previousTimeout;
+        }
+        return result;
+    }
+
+    bool sendStreamingRequest(std::string_view method,
+                              std::string_view path,
+                              const RequestHeaders& headers,
+                              std::string_view body,
+                              const HttpClientStreamHeadersCallback& headersCallback,
+                              const HttpClientStreamDataCallback& dataCallback,
+                              const HttpClientStreamCompleteCallback& completeCallback) {
+        if (!connected_) {
+            setLastError(ErrorCode::ConnectionError, "HTTP client is not connected");
+            return false;
+        }
+        if (awaitingResponse_) {
+            setLastError(ErrorCode::AlreadyRunning, "An HTTP request is already in flight");
+            return false;
+        }
+        if (!isValidHttpMethodName(method)) {
+            setLastError(ErrorCode::InvalidArgument, "Invalid HTTP method");
+            return false;
+        }
+
+        clearLastError();
+        pendingRequest_.method = std::string(method);
+        pendingRequest_.path = buildRequestPath(path);
+        pendingRequest_.headers = headers;
+        pendingRequest_.body.assign(body.begin(), body.end());
+        responseCallback_ = nullptr;
+        streamHeadersCallback_ = headersCallback;
+        streamDataCallback_ = dataCallback;
+        streamCompleteCallback_ = completeCallback;
+        streamingResponse_ = true;
+        streamHeadersParsed_ = false;
+        streamNoBody_ = false;
+        streamChunked_ = false;
+        streamContentLength_.reset();
+        streamReceivedBodyBytes_ = 0;
+        streamResponse_ = HttpResponse{};
+        return sendPendingRequest();
+    }
+
+    bool sendStreamingRequestObject(const HttpClientRequest& request,
+                                    const HttpClientStreamHeadersCallback& headersCallback,
+                                    const HttpClientStreamDataCallback& dataCallback,
+                                    const HttpClientStreamCompleteCallback& completeCallback) {
+        const uint32_t previousTimeout = requestTimeout_;
+        if (request.timeoutMs() != 0) {
+            requestTimeout_ = request.timeoutMs();
+        }
+        const bool result = sendStreamingRequest(request.method(),
+                                                 request.path(),
+                                                 request.headers(),
+                                                 request.body(),
+                                                 headersCallback,
+                                                 dataCallback,
+                                                 completeCallback);
+        if (!result || request.timeoutMs() == 0) {
+            requestTimeout_ = previousTimeout;
+        } else {
+            pendingRequestOverrideTimeout_ = previousTimeout;
+        }
+        return result;
+    }
+
     bool sendPendingRequest() {
         if (!connected_) {
             setLastError(ErrorCode::ConnectionError, "HTTP client is not connected");
             return false;
         }
 
+        RequestHeaders transportHeaders = pendingRequest_.headers;
+        applyProxyHeaders(transportHeaders);
+
         std::string request = buildClientRequest(pendingRequest_.method,
-                                                 pendingRequest_.path,
-                                                 pendingRequest_.headers,
+                                                 buildTransportRequestTarget(pendingRequest_.path),
+                                                 transportHeaders,
                                                  pendingRequest_.body,
                                                  buildHostHeader(),
                                                  useCompression_);
@@ -691,6 +980,8 @@ private:
                                                     : Error(ErrorCode::ConnectionError,
                                                             "Failed to send HTTP request"));
             awaitingResponse_ = false;
+            streamingResponse_ = false;
+            restoreRequestTimeoutOverride();
         }
         return sent;
     }
@@ -737,6 +1028,257 @@ private:
 
             response = buildResponse(responseView);
             return true;
+        }
+    }
+
+    std::string_view responseBufferView() const {
+        return std::string_view(reinterpret_cast<const char*>(responseBuffer_.data()), responseBuffer_.size());
+    }
+
+    void eraseResponseBufferPrefix(size_t bytes) {
+        if (bytes >= responseBuffer_.size()) {
+            responseBuffer_.clear();
+            return;
+        }
+        responseBuffer_.erase(responseBuffer_.begin(), responseBuffer_.begin() + static_cast<std::ptrdiff_t>(bytes));
+    }
+
+    bool parseStreamingHeaders(bool connectionClosed) {
+        while (!streamHeadersParsed_) {
+            const std::string_view raw = responseBufferView();
+            const size_t headerEnd = raw.find("\r\n\r\n");
+            if (headerEnd == std::string_view::npos) {
+                if (connectionClosed) {
+                    setLastError(ErrorCode::HttpProtocolError, "Incomplete HTTP response head");
+                    completeStreamingWithStatus(0, "Incomplete HTTP response head");
+                }
+                return false;
+            }
+
+            HttpResponseView responseView;
+            if (!HttpParser::parseResponseHead(raw, responseView)) {
+                setLastError(ErrorCode::HttpProtocolError, "Invalid HTTP response head");
+                completeStreamingWithStatus(0, "Invalid HTTP response head");
+                return false;
+            }
+
+            eraseResponseBufferPrefix(headerEnd + 4);
+            if (isInterimResponseStatus(responseView.statusCode)) {
+                continue;
+            }
+
+            streamResponse_ = buildResponse(responseView);
+            streamResponse_.body.clear();
+            streamHeadersParsed_ = true;
+            streamNoBody_ =
+                HttpParser::caseInsensitiveCompare(pendingRequest_.method, "HEAD") ||
+                (responseView.statusCode >= 100 && responseView.statusCode < 200) ||
+                responseView.statusCode == 204 ||
+                responseView.statusCode == 304;
+
+            const auto transferEncoding = responseView.getHeader("Transfer-Encoding");
+            streamChunked_ = transferEncoding.has_value() &&
+                             containsHeaderTokenCaseInsensitive(*transferEncoding, "chunked");
+            streamContentLength_.reset();
+            streamReceivedBodyBytes_ = 0;
+            const auto contentLength = responseView.getHeader("Content-Length");
+            if (!streamChunked_ && contentLength.has_value()) {
+                try {
+                    streamContentLength_ = static_cast<size_t>(std::stoull(std::string(*contentLength)));
+                } catch (...) {
+                    setLastError(ErrorCode::HttpProtocolError, "Invalid HTTP Content-Length");
+                    completeStreamingWithStatus(0, "Invalid HTTP Content-Length");
+                    return false;
+                }
+            }
+
+            if (streamHeadersCallback_) {
+                streamHeadersCallback_(streamResponse_);
+                if (!streamingResponse_) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool deliverStreamingChunk(std::string_view chunk) {
+        if (chunk.empty()) {
+            return true;
+        }
+        if (streamDataCallback_ && !streamDataCallback_(chunk)) {
+            setLastError(ErrorCode::ConnectionError, "HTTP stream cancelled by data callback");
+            completeStreamingWithStatus(0, "HTTP stream cancelled by data callback");
+            tcpClient_.disconnect();
+            return false;
+        }
+        return streamingResponse_;
+    }
+
+    bool consumeStreamingChunkedBody() {
+        while (streamingResponse_) {
+            const std::string_view raw = responseBufferView();
+            const size_t lineEnd = raw.find("\r\n");
+            if (lineEnd == std::string_view::npos) {
+                return true;
+            }
+
+            std::string_view sizeLine = HttpParser::trim(raw.substr(0, lineEnd));
+            const size_t extensionPos = sizeLine.find(';');
+            if (extensionPos != std::string_view::npos) {
+                sizeLine = HttpParser::trim(sizeLine.substr(0, extensionPos));
+            }
+
+            const auto chunkSize = parseHexSize(sizeLine);
+            if (!chunkSize.has_value()) {
+                setLastError(ErrorCode::HttpProtocolError, "Invalid HTTP chunk size");
+                completeStreamingWithStatus(0, "Invalid HTTP chunk size");
+                tcpClient_.disconnect();
+                return false;
+            }
+
+            const size_t chunkBodyOffset = lineEnd + 2;
+            if (*chunkSize == 0) {
+                size_t trailerOffset = chunkBodyOffset;
+                while (true) {
+                    const size_t trailerEnd = raw.find("\r\n", trailerOffset);
+                    if (trailerEnd == std::string_view::npos) {
+                        return true;
+                    }
+                    const std::string_view trailerLine = raw.substr(trailerOffset, trailerEnd - trailerOffset);
+                    trailerOffset = trailerEnd + 2;
+                    if (trailerLine.empty()) {
+                        eraseResponseBufferPrefix(trailerOffset);
+                        completeStreamingResponse();
+                        return false;
+                    }
+                    const size_t colon = trailerLine.find(':');
+                    if (colon == std::string_view::npos || colon == 0) {
+                        setLastError(ErrorCode::HttpProtocolError, "Invalid HTTP chunk trailer");
+                        completeStreamingWithStatus(0, "Invalid HTTP chunk trailer");
+                        tcpClient_.disconnect();
+                        return false;
+                    }
+                }
+            }
+
+            if (raw.size() < chunkBodyOffset + *chunkSize + 2) {
+                return true;
+            }
+            if (raw.substr(chunkBodyOffset + *chunkSize, 2) != "\r\n") {
+                setLastError(ErrorCode::HttpProtocolError, "Malformed HTTP chunk");
+                completeStreamingWithStatus(0, "Malformed HTTP chunk");
+                tcpClient_.disconnect();
+                return false;
+            }
+
+            const std::string_view chunk = raw.substr(chunkBodyOffset, *chunkSize);
+            if (!deliverStreamingChunk(chunk)) {
+                return false;
+            }
+            eraseResponseBufferPrefix(chunkBodyOffset + *chunkSize + 2);
+        }
+        return false;
+    }
+
+    bool consumeStreamingFixedLengthBody() {
+        if (!streamContentLength_.has_value() || streamReceivedBodyBytes_ >= *streamContentLength_) {
+            completeStreamingResponse();
+            return false;
+        }
+        while (streamingResponse_ && streamContentLength_.has_value() && !responseBuffer_.empty()) {
+            const size_t remaining = *streamContentLength_ - streamReceivedBodyBytes_;
+            if (remaining == 0) {
+                completeStreamingResponse();
+                return false;
+            }
+            const size_t bytesToDeliver = std::min(remaining, responseBuffer_.size());
+            const std::string_view chunk = responseBufferView().substr(0, bytesToDeliver);
+            if (!deliverStreamingChunk(chunk)) {
+                return false;
+            }
+            streamReceivedBodyBytes_ += bytesToDeliver;
+            eraseResponseBufferPrefix(bytesToDeliver);
+            if (streamReceivedBodyBytes_ >= *streamContentLength_) {
+                completeStreamingResponse();
+                return false;
+            }
+        }
+        return streamingResponse_;
+    }
+
+    void handleStreamingDataReceived(bool connectionClosed) {
+        if (!parseStreamingHeaders(connectionClosed) || !streamingResponse_) {
+            return;
+        }
+
+        if (streamNoBody_) {
+            completeStreamingResponse();
+            return;
+        }
+
+        if (streamChunked_) {
+            consumeStreamingChunkedBody();
+            return;
+        }
+
+        if (streamContentLength_.has_value()) {
+            if (*streamContentLength_ == 0 || streamReceivedBodyBytes_ >= *streamContentLength_) {
+                completeStreamingResponse();
+                return;
+            }
+            consumeStreamingFixedLengthBody();
+            return;
+        }
+
+        if (!responseBuffer_.empty()) {
+            const std::string_view chunk = responseBufferView();
+            if (!deliverStreamingChunk(chunk)) {
+                return;
+            }
+            responseBuffer_.clear();
+        }
+
+        if (connectionClosed) {
+            completeStreamingResponse();
+        }
+    }
+
+    void completeStreamingResponse() {
+        stopRequestTimer();
+        clearLastError();
+        restoreRequestTimeoutOverride();
+        awaitingResponse_ = false;
+        streamingResponse_ = false;
+        streamHeadersParsed_ = false;
+        streamNoBody_ = false;
+        streamChunked_ = false;
+        streamContentLength_.reset();
+        streamReceivedBodyBytes_ = 0;
+        responseBuffer_.clear();
+        if (streamCompleteCallback_) {
+            streamCompleteCallback_(streamResponse_);
+        }
+    }
+
+    void completeStreamingWithStatus(int statusCode, const std::string& message) {
+        stopRequestTimer();
+        restoreRequestTimeoutOverride();
+        awaitingResponse_ = false;
+        streamingResponse_ = false;
+        streamHeadersParsed_ = false;
+        streamNoBody_ = false;
+        streamChunked_ = false;
+        streamContentLength_.reset();
+        streamReceivedBodyBytes_ = 0;
+        responseBuffer_.clear();
+
+        HttpResponse response = streamResponse_;
+        response.statusCode = statusCode;
+        response.statusMessage = message;
+        response.body.clear();
+        if (streamCompleteCallback_) {
+            streamCompleteCallback_(response);
         }
     }
 
@@ -842,6 +1384,7 @@ private:
             }
         }
 
+        restoreRequestTimeoutOverride();
         if (responseCallback_) {
             responseCallback_(response);
         }
@@ -865,6 +1408,12 @@ private:
             self->setLastError(ErrorCode::TimeoutError, "Request timeout");
             self->tcpClient_.disconnect();
 
+            if (self->streamingResponse_) {
+                self->completeStreamingWithStatus(0, "Request timeout");
+                return;
+            }
+
+            self->restoreRequestTimeoutOverride();
             if (self->responseCallback_) {
                 HttpResponse response;
                 response.statusCode = 0;
@@ -880,7 +1429,18 @@ private:
         }
     }
 
+    void restoreRequestTimeoutOverride() {
+        if (!pendingRequestOverrideTimeout_.has_value()) {
+            return;
+        }
+        requestTimeout_ = *pendingRequestOverrideTimeout_;
+        pendingRequestOverrideTimeout_.reset();
+    }
+
     SSLConfig buildEffectiveSslConfig() const {
+        if (shouldUseHttpProxy()) {
+            return SSLConfig{};
+        }
         SSLConfig effective = sslConfig_;
         effective.enableSSL = parsedUrl_.protocol == "https";
         if (effective.enableSSL &&
@@ -890,6 +1450,33 @@ private:
             effective.hostnameVerification = parsedUrl_.host;
         }
         return effective;
+    }
+
+    bool shouldUseHttpProxy() const {
+        return proxyOptions_.enabled();
+    }
+
+    std::string buildTransportRequestTarget(const std::string& path) const {
+        if (!shouldUseHttpProxy() || parsedUrl_.protocol != "http" || path == "*") {
+            return path;
+        }
+        return parsedUrl_.protocol + "://" + buildHostHeader() + path;
+    }
+
+    void applyProxyHeaders(RequestHeaders& headers) const {
+        if (!shouldUseHttpProxy()) {
+            return;
+        }
+
+        for (const auto& [name, value] : proxyOptions_.headers) {
+            headers[name] = value;
+        }
+
+        if (!proxyOptions_.username.empty()) {
+            eraseHeaderCaseInsensitive(headers, "Proxy-Authorization");
+            headers["Proxy-Authorization"] =
+                "Basic " + base64Encode(proxyOptions_.username + ":" + proxyOptions_.password);
+        }
     }
 
     std::string buildHostHeader() const {
@@ -902,6 +1489,52 @@ private:
             return renderedHost;
         }
         return renderedHost + ":" + std::to_string(parsedUrl_.port);
+    }
+
+    bool parseProxyUrl(std::string_view proxyUrl, HttpProxyOptions& result) const {
+        result = {};
+        proxyUrl = HttpParser::trim(proxyUrl);
+        if (proxyUrl.empty()) {
+            return false;
+        }
+
+        std::string protocol = "http";
+        const size_t protocolPos = proxyUrl.find("://");
+        if (protocolPos != std::string_view::npos) {
+            protocol = toLowerCopy(proxyUrl.substr(0, protocolPos));
+            proxyUrl.remove_prefix(protocolPos + 3);
+        }
+        if (protocol != "http") {
+            return false;
+        }
+
+        const size_t pathPos = proxyUrl.find_first_of("/?#");
+        std::string_view authority =
+            pathPos == std::string_view::npos ? proxyUrl : proxyUrl.substr(0, pathPos);
+        if (authority.empty()) {
+            return false;
+        }
+
+        const size_t userInfoPos = authority.rfind('@');
+        if (userInfoPos != std::string_view::npos) {
+            const std::string_view userInfo = authority.substr(0, userInfoPos);
+            authority.remove_prefix(userInfoPos + 1);
+            const size_t colonPos = userInfo.find(':');
+            if (colonPos == std::string_view::npos) {
+                result.username = HttpParser::urlDecode(userInfo);
+            } else {
+                result.username = HttpParser::urlDecode(userInfo.substr(0, colonPos));
+                result.password = HttpParser::urlDecode(userInfo.substr(colonPos + 1));
+            }
+        }
+
+        const auto address = Address::parse(authority, 8080);
+        if (!address.has_value() || address->port == 0) {
+            return false;
+        }
+        result.host = address->normalizedHost();
+        result.port = address->port;
+        return true;
     }
 
     bool parseUrl(std::string_view url, ParsedUrl& result) const {
@@ -1057,25 +1690,37 @@ private:
     bool connected_ = false;
     bool awaitingResponse_ = false;
     bool replayAfterConnect_ = false;
+    bool streamingResponse_ = false;
+    bool streamHeadersParsed_ = false;
+    bool streamNoBody_ = false;
+    bool streamChunked_ = false;
+    std::optional<size_t> streamContentLength_;
+    size_t streamReceivedBodyBytes_ = 0;
 
     ParsedUrl parsedUrl_;
     PendingRequest pendingRequest_;
     Buffer responseBuffer_;
+    HttpResponse streamResponse_;
     std::unique_ptr<Timer> requestTimer_;
 
     uint32_t connectTimeout_ = 5000;
     uint32_t requestTimeout_ = 5000;
     uint32_t readTimeout_ = 5000;
+    std::optional<uint32_t> pendingRequestOverrideTimeout_;
     bool followRedirects_ = true;
     uint32_t maxRedirects_ = 5;
     uint32_t redirectCount_ = 0;
     bool useCompression_ = false;
     SSLConfig sslConfig_;
+    HttpProxyOptions proxyOptions_;
     mutable std::mutex errorMutex_;
     Error lastError_;
 
     HttpClientConnectCallback connectCallback_;
     HttpClientResponseCallback responseCallback_;
+    HttpClientStreamHeadersCallback streamHeadersCallback_;
+    HttpClientStreamDataCallback streamDataCallback_;
+    HttpClientStreamCompleteCallback streamCompleteCallback_;
 };
 
 HttpClient::HttpClient(IoService& ioService)
@@ -1130,6 +1775,39 @@ bool HttpClient::request(std::string_view method,
     return impl_->request(method, path, headers, body, callback);
 }
 
+bool HttpClient::request(const HttpClientRequest& request, const HttpClientResponseCallback& callback) {
+    return impl_->request(request, callback);
+}
+
+bool HttpClient::streamRequest(std::string_view method,
+                               std::string_view path,
+                               const RequestHeaders& headers,
+                               std::string_view body,
+                               const HttpClientStreamHeadersCallback& headersCallback,
+                               const HttpClientStreamDataCallback& dataCallback,
+                               const HttpClientStreamCompleteCallback& completeCallback) {
+    return impl_->streamRequest(method, path, headers, body, headersCallback, dataCallback, completeCallback);
+}
+
+bool HttpClient::streamRequest(const HttpClientRequest& request,
+                               const HttpClientStreamHeadersCallback& headersCallback,
+                               const HttpClientStreamDataCallback& dataCallback,
+                               const HttpClientStreamCompleteCallback& completeCallback) {
+    return impl_->streamRequest(request, headersCallback, dataCallback, completeCallback);
+}
+
+bool HttpClient::streamGet(const std::string& path,
+                           const RequestHeaders& headers,
+                           const HttpClientStreamHeadersCallback& headersCallback,
+                           const HttpClientStreamDataCallback& dataCallback,
+                           const HttpClientStreamCompleteCallback& completeCallback) {
+    return impl_->streamGet(path, headers, headersCallback, dataCallback, completeCallback);
+}
+
+void HttpClient::cancelRequest() {
+    impl_->cancelRequest();
+}
+
 void HttpClient::disconnect() {
     impl_->disconnect();
 }
@@ -1160,6 +1838,18 @@ void HttpClient::setUseCompression(bool use) {
 
 void HttpClient::setSSLConfig(const SSLConfig& sslConfig) {
     impl_->setSSLConfig(sslConfig);
+}
+
+bool HttpClient::setProxyUrl(std::string_view proxyUrl) {
+    return impl_->setProxyUrl(proxyUrl);
+}
+
+void HttpClient::setProxy(const HttpProxyOptions& proxyOptions) {
+    impl_->setProxy(proxyOptions);
+}
+
+void HttpClient::clearProxy() {
+    impl_->clearProxy();
 }
 
 bool HttpClient::isConnected() const {

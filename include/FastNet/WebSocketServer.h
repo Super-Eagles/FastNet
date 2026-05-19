@@ -6,13 +6,47 @@
 
 #include "Config.h"
 #include "Error.h"
+#include "HttpParser.h"
 #include "IoService.h"
 
 #include <functional>
+#include <map>
 #include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace FastNet {
+
+using WebSocketServerHeaders = std::map<std::string, std::string>;
+
+struct FASTNET_API WebSocketServerHandshakeRequest {
+    std::string target;
+    std::string path;
+    std::string queryString;
+    WebSocketServerHeaders headers;
+    std::vector<std::string> requestedSubprotocols;
+    Address clientAddress;
+
+    std::optional<std::string> getHeader(std::string_view name) const {
+        for (const auto& [headerName, value] : headers) {
+            if (HttpParser::caseInsensitiveCompare(headerName, name)) {
+                return value;
+            }
+        }
+        return std::nullopt;
+    }
+};
+
+struct FASTNET_API WebSocketServerHandshakeResponse {
+    bool accept = true;
+    std::string acceptedSubprotocol;
+    WebSocketServerHeaders headers;
+    int rejectStatusCode = 403;
+    std::string rejectStatusMessage = "Forbidden";
+    std::string rejectBody = "WebSocket handshake rejected";
+};
 
 using WebSocketServerClientConnectedCallback = std::function<void(ConnectionId clientId, const Address& clientAddress)>;
 using WebSocketServerClientDisconnectedCallback =
@@ -21,6 +55,9 @@ using WebSocketServerMessageCallback = std::function<void(ConnectionId clientId,
 using WebSocketServerBinaryCallback = std::function<void(ConnectionId clientId, const Buffer& data)>;
 using WebSocketServerBinaryOwnedCallback = std::function<void(ConnectionId clientId, Buffer&& data)>;
 using WebSocketServerErrorCallback = std::function<void(const Error& error)>;
+using WebSocketServerHandshakeCallback = std::function<void(ConnectionId clientId,
+                                                           const WebSocketServerHandshakeRequest& request,
+                                                           WebSocketServerHandshakeResponse& response)>;
 
 class FASTNET_API WebSocketServer {
 public:
@@ -43,7 +80,11 @@ public:
     size_t getClientCount() const;
     std::vector<ConnectionId> getClientIds() const;
     Address getClientAddress(ConnectionId clientId) const;
+    std::optional<std::string> getClientSubprotocol(ConnectionId clientId) const;
 
+    void setHandshakeCallback(const WebSocketServerHandshakeCallback& callback);
+    void setHandshakeResponseHeaders(const WebSocketServerHeaders& headers);
+    void setSubprotocols(const std::vector<std::string>& subprotocols);
     void setClientConnectedCallback(const WebSocketServerClientConnectedCallback& callback);
     void setClientDisconnectedCallback(const WebSocketServerClientDisconnectedCallback& callback);
     void setMessageCallback(const WebSocketServerMessageCallback& callback);

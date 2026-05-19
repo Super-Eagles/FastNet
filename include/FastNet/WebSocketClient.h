@@ -8,11 +8,15 @@
 #include "IoService.h"
 
 #include <functional>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace FastNet {
 
+using WebSocketHeaders = std::map<std::string, std::string>;
 using WebSocketConnectCallback = std::function<void(bool success, const std::string& errorMessage)>;
 using WebSocketMessageCallback = std::function<void(const std::string& message)>;
 using WebSocketBinaryCallback = std::function<void(const Buffer& data)>;
@@ -26,10 +30,15 @@ public:
     ~WebSocketClient();
 
     bool connect(const std::string& url, const WebSocketConnectCallback& callback);
+    bool connect(const std::string& url,
+                 const WebSocketHeaders& headers,
+                 const WebSocketConnectCallback& callback);
     bool sendText(const std::string& message);
     bool sendBinary(const Buffer& data);
     void close(uint16_t code = 1000, const std::string& reason = "Normal closure");
 
+    void setHandshakeHeaders(const WebSocketHeaders& headers);
+    void setSubprotocols(const std::vector<std::string>& subprotocols);
     void setConnectCallback(const WebSocketConnectCallback& callback);
     void setMessageCallback(const WebSocketMessageCallback& callback);
     void setBinaryCallback(const WebSocketBinaryCallback& callback);
@@ -43,6 +52,7 @@ public:
     bool isConnected() const;
     Address getLocalAddress() const;
     Address getRemoteAddress() const;
+    std::optional<std::string> getAcceptedSubprotocol() const;
 
 private:
     class Impl;

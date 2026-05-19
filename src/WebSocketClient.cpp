@@ -12,9 +12,51 @@
 
 #include <algorithm>
 #include <cctype>
+#include <string_view>
 #include <utility>
 
 namespace FastNet {
+
+namespace {
+
+void appendHeaderLine(std::string& request, std::string_view name, std::string_view value) {
+    request.append(name.data(), name.size());
+    request.append(": ", 2);
+    request.append(value.data(), value.size());
+    request.append("\r\n", 2);
+}
+
+bool isReservedHandshakeHeader(std::string_view name) {
+    return HttpParser::caseInsensitiveCompare(name, "Host") ||
+           HttpParser::caseInsensitiveCompare(name, "Upgrade") ||
+           HttpParser::caseInsensitiveCompare(name, "Connection") ||
+           HttpParser::caseInsensitiveCompare(name, "Sec-WebSocket-Key") ||
+           HttpParser::caseInsensitiveCompare(name, "Sec-WebSocket-Version") ||
+           HttpParser::caseInsensitiveCompare(name, "Sec-WebSocket-Protocol");
+}
+
+std::string joinSubprotocols(const std::vector<std::string>& subprotocols) {
+    std::string value;
+    for (const auto& protocol : subprotocols) {
+        if (protocol.empty()) {
+            continue;
+        }
+        if (!value.empty()) {
+            value += ", ";
+        }
+        value += protocol;
+    }
+    return value;
+}
+
+bool containsSubprotocol(const std::vector<std::string>& subprotocols, std::string_view accepted) {
+    accepted = HttpParser::trim(accepted);
+    return std::any_of(subprotocols.begin(), subprotocols.end(), [accepted](const std::string& protocol) {
+        return HttpParser::caseInsensitiveCompare(protocol, accepted);
+    });
+}
+
+} // namespace
 
 class WebSocketClient::Impl : public std::enable_shared_from_this<WebSocketClient::Impl> {
 public:
@@ -28,7 +70,15 @@ public:
     }
 
     bool connect(const std::string& url, const WebSocketConnectCallback& callback) {
+        return connect(url, {}, callback);
+    }
+
+    bool connect(const std::string& url,
+                 const WebSocketHeaders& headers,
+                 const WebSocketConnectCallback& callback) {
         pendingConnectCallback_ = callback;
+        oneShotHandshakeHeaders_ = headers;
+        acceptedSubprotocol_.reset();
         closeNotified_ = false;
         closeFrameSent_ = false;
         buffer_.clear();
@@ -118,6 +168,8 @@ public:
     }
     void setErrorCallback(const WebSocketErrorCallback& callback) { errorCallback_ = callback; }
     void setCloseCallback(const WebSocketCloseCallback& callback) { closeCallback_ = callback; }
+    void setHandshakeHeaders(const WebSocketHeaders& headers) { handshakeHeaders_ = headers; }
+    void setSubprotocols(const std::vector<std::string>& subprotocols) { subprotocols_ = subprotocols; }
     void setConnectTimeout(uint32_t timeoutMs) { connectionTimeout_ = timeoutMs; }
     void setPingInterval(uint32_t intervalMs) { pingInterval_ = intervalMs; }
     void setSSLConfig(const SSLConfig& sslConfig) { sslConfig_ = sslConfig; }
@@ -125,6 +177,7 @@ public:
     bool isConnected() const { return connected_; }
     Address getLocalAddress() const { return tcpClient_.getLocalAddress(); }
     Address getRemoteAddress() const { return tcpClient_.getRemoteAddress(); }
+    std::optional<std::string> getAcceptedSubprotocol() const { return acceptedSubprotocol_; }
     void initializeCallbacks() {
         std::weak_ptr<Impl> weakSelf = shared_from_this();
         tcpClient_.setOwnedDataReceivedCallback([weakSelf](Buffer&& data) {
@@ -296,14 +349,29 @@ private:
 
     bool sendHandshakeRequest() {
         std::string request;
-        request.reserve(resourcePath_.size() + serverAddress_.size() + handshakeKey_.size() + 128);
+        request.reserve(resourcePath_.size() + serverAddress_.size() + handshakeKey_.size() + 256);
         request += "GET ";
         request += resourcePath_;
         request += " HTTP/1.1\r\nHost: ";
         request += buildHostHeader();
         request += "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ";
         request += handshakeKey_;
-        request += "\r\nSec-WebSocket-Version: 13\r\nUser-Agent: FastNet-WebSocketClient/2.0\r\n\r\n";
+        request += "\r\nSec-WebSocket-Version: 13\r\nUser-Agent: FastNet-WebSocketClient/2.0\r\n";
+
+        const std::string requestedSubprotocols = joinSubprotocols(subprotocols_);
+        if (!requestedSubprotocols.empty()) {
+            appendHeaderLine(request, "Sec-WebSocket-Protocol", requestedSubprotocols);
+        }
+
+        for (const auto* headers : {&handshakeHeaders_, &oneShotHandshakeHeaders_}) {
+            for (const auto& [name, value] : *headers) {
+                if (!isReservedHandshakeHeader(name)) {
+                    appendHeaderLine(request, name, value);
+                }
+            }
+        }
+
+        request += "\r\n";
         return tcpClient_.send(std::move(request));
     }
 
@@ -335,6 +403,7 @@ private:
         const auto upgrade = responseView.getHeader("Upgrade");
         const auto connection = responseView.getHeader("Connection");
         const auto accept = responseView.getHeader("Sec-WebSocket-Accept");
+        const auto acceptedProtocol = responseView.getHeader("Sec-WebSocket-Protocol");
         if (responseView.statusCode != 101 ||
             !upgrade.has_value() ||
             !connection.has_value() ||
@@ -355,6 +424,16 @@ private:
             notifyConnect(false, "WebSocket handshake validation failed");
             tcpClient_.disconnect();
             return;
+        }
+
+        acceptedSubprotocol_.reset();
+        if (acceptedProtocol.has_value()) {
+            if (subprotocols_.empty() || !containsSubprotocol(subprotocols_, *acceptedProtocol)) {
+                notifyConnect(false, "WebSocket server selected an unexpected subprotocol");
+                tcpClient_.disconnect();
+                return;
+            }
+            acceptedSubprotocol_ = std::string(HttpParser::trim(*acceptedProtocol));
         }
 
         if (handshakeTimer_) {
@@ -384,7 +463,9 @@ private:
 
             Buffer payload;
             WSFrameMetadata metadata;
-            if (!WebSocketProtocol::decodeFrame(pending.substr(0, frameSize), payload, metadata) || !metadata.final) {
+            if (!WebSocketProtocol::decodeFrame(pending.substr(0, frameSize), payload, metadata) ||
+                !metadata.final ||
+                metadata.masked) {
                 handleError(Error(ErrorCode::WebSocketFrameError, "Invalid WebSocket frame"));
                 tcpClient_.disconnect();
                 return;
@@ -626,6 +707,10 @@ private:
     uint16_t serverPort_ = 0;
     std::string resourcePath_ = "/";
     std::string handshakeKey_;
+    WebSocketHeaders handshakeHeaders_;
+    WebSocketHeaders oneShotHandshakeHeaders_;
+    std::vector<std::string> subprotocols_;
+    std::optional<std::string> acceptedSubprotocol_;
     Buffer buffer_;
     size_t bufferOffset_ = 0;
     std::unique_ptr<Timer> pingTimer_;
@@ -652,6 +737,12 @@ bool WebSocketClient::connect(const std::string& url, const WebSocketConnectCall
     return impl_->connect(url, callback);
 }
 
+bool WebSocketClient::connect(const std::string& url,
+                              const WebSocketHeaders& headers,
+                              const WebSocketConnectCallback& callback) {
+    return impl_->connect(url, headers, callback);
+}
+
 bool WebSocketClient::sendText(const std::string& message) {
     return impl_->sendText(message);
 }
@@ -662,6 +753,14 @@ bool WebSocketClient::sendBinary(const Buffer& data) {
 
 void WebSocketClient::close(uint16_t code, const std::string& reason) {
     impl_->close(code, reason);
+}
+
+void WebSocketClient::setHandshakeHeaders(const WebSocketHeaders& headers) {
+    impl_->setHandshakeHeaders(headers);
+}
+
+void WebSocketClient::setSubprotocols(const std::vector<std::string>& subprotocols) {
+    impl_->setSubprotocols(subprotocols);
 }
 
 void WebSocketClient::setConnectCallback(const WebSocketConnectCallback& callback) {
@@ -710,6 +809,10 @@ Address WebSocketClient::getLocalAddress() const {
 
 Address WebSocketClient::getRemoteAddress() const {
     return impl_->getRemoteAddress();
+}
+
+std::optional<std::string> WebSocketClient::getAcceptedSubprotocol() const {
+    return impl_->getAcceptedSubprotocol();
 }
 
 } // namespace FastNet

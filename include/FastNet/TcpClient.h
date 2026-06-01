@@ -35,6 +35,7 @@ public:
     bool connect(const Address& remoteAddress,
                  const ConnectCallback& callback,
                  const SSLConfig& sslConfig = SSLConfig());
+    bool startTls(const SSLConfig& sslConfig, const ConnectCallback& callback);
     void disconnect();
     void disconnectAfterPendingWrites();
     bool send(const Buffer& data);

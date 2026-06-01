@@ -53,14 +53,44 @@ const std::string& currentThreadIdString() {
 
 } // namespace
 
+struct AsyncLogger::Impl {
+    Impl() : minLevel_(LogLevel::INFO), mirrorToConsole_(false), running_(false) {}
+
+    std::string formatLogLine(LogLevel level,
+                              const char* file,
+                              int line,
+                              const char* func,
+                              std::string_view message) const;
+    void writerLoop();
+    void writeBuffer(const std::string& buffer);
+    void openLogFile();
+    void rotateLogFile();
+    void refreshCurrentFileSize();
+
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    std::thread writeThread_;
+    std::string filePath_;
+    std::ofstream logFile_;
+    std::string currentBuffer_;
+    std::string backBuffer_;
+    std::atomic<LogLevel> minLevel_;
+    std::atomic<bool> mirrorToConsole_;
+    std::atomic<bool> running_;
+    size_t maxFileSize_ = 100 * 1024 * 1024;
+    size_t currentFileSize_ = 0;
+    size_t flushThreshold_ = 256 * 1024;
+    std::chrono::milliseconds flushInterval_{100};
+};
+
 AsyncLogger& AsyncLogger::getInstance() {
     static AsyncLogger logger;
     return logger;
 }
 
-AsyncLogger::AsyncLogger() {
-    currentBuffer_.reserve(4 * 1024 * 1024);
-    backBuffer_.reserve(4 * 1024 * 1024);
+AsyncLogger::AsyncLogger() : pImpl_(std::make_unique<Impl>()) {
+    pImpl_->currentBuffer_.reserve(4 * 1024 * 1024);
+    pImpl_->backBuffer_.reserve(4 * 1024 * 1024);
 }
 
 AsyncLogger::~AsyncLogger() {
@@ -73,65 +103,65 @@ void AsyncLogger::initialize(const std::string& filePath,
                              bool mirrorToConsole) {
     const std::string desiredFilePath = filePath.empty() ? "fastnet.log" : filePath;
 
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (running_.load(std::memory_order_acquire) && desiredFilePath == filePath_) {
-        minLevel_.store(level, std::memory_order_release);
-        mirrorToConsole_.store(mirrorToConsole, std::memory_order_release);
-        maxFileSize_ = std::max<size_t>(maxFileSize, 1024 * 1024);
+    std::unique_lock<std::mutex> lock(pImpl_->mutex_);
+    if (pImpl_->running_.load(std::memory_order_acquire) && desiredFilePath == pImpl_->filePath_) {
+        pImpl_->minLevel_.store(level, std::memory_order_release);
+        pImpl_->mirrorToConsole_.store(mirrorToConsole, std::memory_order_release);
+        pImpl_->maxFileSize_ = std::max<size_t>(maxFileSize, 1024 * 1024);
         return;
     }
 
-    if (running_.load(std::memory_order_acquire)) {
-        running_.store(false, std::memory_order_release);
-        condition_.notify_one();
+    if (pImpl_->running_.load(std::memory_order_acquire)) {
+        pImpl_->running_.store(false, std::memory_order_release);
+        pImpl_->condition_.notify_one();
         lock.unlock();
-        if (writeThread_.joinable()) {
-            writeThread_.join();
+        if (pImpl_->writeThread_.joinable()) {
+            pImpl_->writeThread_.join();
         }
         lock.lock();
-    } else if (writeThread_.joinable()) {
+    } else if (pImpl_->writeThread_.joinable()) {
         lock.unlock();
-        writeThread_.join();
+        pImpl_->writeThread_.join();
         lock.lock();
     }
 
-    filePath_ = desiredFilePath;
-    minLevel_.store(level, std::memory_order_release);
-    mirrorToConsole_.store(mirrorToConsole, std::memory_order_release);
-    maxFileSize_ = std::max<size_t>(maxFileSize, 1024 * 1024);
-    currentFileSize_ = 0;
-    currentBuffer_.clear();
-    backBuffer_.clear();
+    pImpl_->filePath_ = desiredFilePath;
+    pImpl_->minLevel_.store(level, std::memory_order_release);
+    pImpl_->mirrorToConsole_.store(mirrorToConsole, std::memory_order_release);
+    pImpl_->maxFileSize_ = std::max<size_t>(maxFileSize, 1024 * 1024);
+    pImpl_->currentFileSize_ = 0;
+    pImpl_->currentBuffer_.clear();
+    pImpl_->backBuffer_.clear();
 
-    openLogFile();
-    running_.store(true, std::memory_order_release);
-    writeThread_ = std::thread(&AsyncLogger::writerLoop, this);
+    pImpl_->openLogFile();
+    pImpl_->running_.store(true, std::memory_order_release);
+    pImpl_->writeThread_ = std::thread(&AsyncLogger::Impl::writerLoop, pImpl_.get());
 }
 
 void AsyncLogger::shutdown() {
-    if (!running_.exchange(false, std::memory_order_acq_rel)) {
+    if (!pImpl_->running_.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
 
-    condition_.notify_one();
-    if (writeThread_.joinable()) {
-        writeThread_.join();
+    pImpl_->condition_.notify_one();
+    if (pImpl_->writeThread_.joinable()) {
+        pImpl_->writeThread_.join();
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (logFile_.is_open()) {
-        logFile_.flush();
-        logFile_.close();
+    std::lock_guard<std::mutex> lock(pImpl_->mutex_);
+    if (pImpl_->logFile_.is_open()) {
+        pImpl_->logFile_.flush();
+        pImpl_->logFile_.close();
     }
-    currentBuffer_.clear();
-    backBuffer_.clear();
+    pImpl_->currentBuffer_.clear();
+    pImpl_->backBuffer_.clear();
 }
 
 void AsyncLogger::flush() {
-    if (!running_.load(std::memory_order_acquire)) {
+    if (!pImpl_->running_.load(std::memory_order_acquire)) {
         return;
     }
-    condition_.notify_one();
+    pImpl_->condition_.notify_one();
 }
 
 void AsyncLogger::log(LogLevel level,
@@ -139,12 +169,12 @@ void AsyncLogger::log(LogLevel level,
                       int line,
                       const char* func,
                       std::string_view message) {
-    if (level < minLevel_.load(std::memory_order_acquire)) {
+    if (level < pImpl_->minLevel_.load(std::memory_order_acquire)) {
         return;
     }
 
-    const std::string logLine = formatLogLine(level, file, line, func, message);
-    if (!running_.load(std::memory_order_acquire)) {
+    const std::string logLine = pImpl_->formatLogLine(level, file, line, func, message);
+    if (!pImpl_->running_.load(std::memory_order_acquire)) {
         if (level >= LogLevel::ERROR_LVL) {
             std::cerr << logLine;
         } else {
@@ -155,37 +185,37 @@ void AsyncLogger::log(LogLevel level,
 
     bool shouldWake = false;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        currentBuffer_.append(logLine);
-        shouldWake = currentBuffer_.size() >= flushThreshold_ || level >= LogLevel::ERROR_LVL;
+        std::lock_guard<std::mutex> lock(pImpl_->mutex_);
+        pImpl_->currentBuffer_.append(logLine);
+        shouldWake = pImpl_->currentBuffer_.size() >= pImpl_->flushThreshold_ || level >= LogLevel::ERROR_LVL;
     }
 
     if (shouldWake) {
-        condition_.notify_one();
+        pImpl_->condition_.notify_one();
     }
 }
 
 void AsyncLogger::setLogLevel(LogLevel level) {
-    minLevel_.store(level, std::memory_order_release);
+    pImpl_->minLevel_.store(level, std::memory_order_release);
 }
 
 LogLevel AsyncLogger::getLogLevel() const {
-    return minLevel_.load(std::memory_order_acquire);
+    return pImpl_->minLevel_.load(std::memory_order_acquire);
 }
 
 void AsyncLogger::setConsoleMirror(bool enabled) {
-    mirrorToConsole_.store(enabled, std::memory_order_release);
+    pImpl_->mirrorToConsole_.store(enabled, std::memory_order_release);
 }
 
 bool AsyncLogger::isRunning() const {
-    return running_.load(std::memory_order_acquire);
+    return pImpl_->running_.load(std::memory_order_acquire);
 }
 
-std::string AsyncLogger::formatLogLine(LogLevel level,
-                                       const char* file,
-                                       int line,
-                                       const char* func,
-                                       std::string_view message) const {
+std::string AsyncLogger::Impl::formatLogLine(LogLevel level,
+                                             const char* file,
+                                             int line,
+                                             const char* func,
+                                             std::string_view message) const {
     // Extract basename from potentially long __FILE__ path.
     const char* baseName = file;
     if (file != nullptr) {
@@ -238,7 +268,7 @@ std::string AsyncLogger::formatLogLine(LogLevel level,
     return output;
 }
 
-void AsyncLogger::writerLoop() {
+void AsyncLogger::Impl::writerLoop() {
     while (true) {
         {
             std::unique_lock<std::mutex> lock(mutex_);
@@ -274,7 +304,7 @@ void AsyncLogger::writerLoop() {
     }
 }
 
-void AsyncLogger::writeBuffer(const std::string& buffer) {
+void AsyncLogger::Impl::writeBuffer(const std::string& buffer) {
     if (buffer.empty()) {
         return;
     }
@@ -298,7 +328,7 @@ void AsyncLogger::writeBuffer(const std::string& buffer) {
     }
 }
 
-void AsyncLogger::openLogFile() {
+void AsyncLogger::Impl::openLogFile() {
     if (filePath_.empty()) {
         filePath_ = "fastnet.log";
     }
@@ -320,7 +350,7 @@ void AsyncLogger::openLogFile() {
     refreshCurrentFileSize();
 }
 
-void AsyncLogger::rotateLogFile() {
+void AsyncLogger::Impl::rotateLogFile() {
     if (!logFile_.is_open()) {
         openLogFile();
         return;
@@ -360,7 +390,7 @@ void AsyncLogger::rotateLogFile() {
     openLogFile();
 }
 
-void AsyncLogger::refreshCurrentFileSize() {
+void AsyncLogger::Impl::refreshCurrentFileSize() {
     std::error_code ec;
     currentFileSize_ = std::filesystem::exists(filePath_, ec)
                            ? static_cast<size_t>(std::filesystem::file_size(filePath_, ec))

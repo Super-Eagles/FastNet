@@ -8,6 +8,9 @@
 #include <mutex>
 #include <utility>
 #include <vector>
+#include <string>
+#include <thread>
+#include "Logger.h"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -716,8 +719,41 @@ int EventPoller::poll(int timeoutMs) noexcept {
     readyEvents.clear();
 
     const int pollResult = impl_->poll(timeoutMs, readyEvents);
-    if (pollResult <= 0) {
+    if (pollResult < 0) {
+#ifdef _WIN32
+        int err = ::WSAGetLastError();
+        if (err == WSAENOTSOCK || err == WSAEINVAL) {
+            // Self-healing: identify and remove invalid sockets
+            std::vector<socket_t> invalidSockets;
+            {
+                std::shared_lock<std::shared_mutex> lock(mutex_);
+                for (const auto& pair : eventMap_) {
+                    socket_t fd = pair.first;
+                    int optval = 0;
+                    int optlen = sizeof(optval);
+                    int res = ::getsockopt(fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&optval), &optlen);
+                    if (res == SOCKET_ERROR && ::WSAGetLastError() == WSAENOTSOCK) {
+                        invalidSockets.push_back(fd);
+                    }
+                }
+            }
+            if (!invalidSockets.empty()) {
+                std::unique_lock<std::shared_mutex> lock(mutex_);
+                for (socket_t fd : invalidSockets) {
+                    ::FastNet::consoleLog(LogLevel::WARN_LVL, "EventPoller: detected and cleaned up orphaned/closed socket " + std::to_string(fd) + " to prevent busy-loop spin.");
+                    impl_->remove(fd);
+                    eventMap_.erase(fd);
+                }
+                impl_->wakeup();
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+#endif
         return pollResult;
+    }
+    if (pollResult == 0) {
+        return 0;
     }
 
     int invoked = 0;

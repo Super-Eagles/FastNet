@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <condition_variable>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -57,31 +58,8 @@ private:
     AsyncLogger();
     ~AsyncLogger();
 
-    std::string formatLogLine(LogLevel level,
-                              const char* file,
-                              int line,
-                              const char* func,
-                              std::string_view message) const;
-    void writerLoop();
-    void writeBuffer(const std::string& buffer);
-    void openLogFile();
-    void rotateLogFile();
-    void refreshCurrentFileSize();
-
-    mutable std::mutex mutex_;
-    std::condition_variable condition_;
-    std::thread writeThread_;
-    std::string filePath_;
-    std::ofstream logFile_;
-    std::string currentBuffer_;
-    std::string backBuffer_;
-    std::atomic<LogLevel> minLevel_{LogLevel::INFO};
-    std::atomic<bool> mirrorToConsole_{false};
-    std::atomic<bool> running_{false};
-    size_t maxFileSize_ = 100 * 1024 * 1024;
-    size_t currentFileSize_ = 0;
-    size_t flushThreshold_ = 256 * 1024;
-    std::chrono::milliseconds flushInterval_{100};
+    struct Impl;
+    std::unique_ptr<Impl> pImpl_;
 };
 
 FASTNET_API void setGlobalLogLevel(LogLevel level);

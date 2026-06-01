@@ -216,11 +216,81 @@ public:
         return true;
     }
 
+    bool startTls(const SSLConfig& sslConfig, const ConnectCallback& callback) {
+        std::lock_guard<std::recursive_mutex> callbackLock(callbackMutex_);
+        if (!running_.load(std::memory_order_acquire) ||
+            !connected_.load(std::memory_order_acquire)) {
+            setLastFailure(ErrorCode::ConnectionError, "Connection is not established");
+            if (callback) {
+                callback(false, "Connection is not established");
+            }
+            return false;
+        }
+        if (tlsState_ == TlsState::Ready || tlsState_ == TlsState::Handshaking) {
+            setLastFailure(ErrorCode::AlreadyRunning, "TLS is already active");
+            if (callback) {
+                callback(false, "TLS is already active");
+            }
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(sendMutex_);
+            if (pendingWriteBytes_ != 0 || !sendQueue_.empty()) {
+                setLastFailure(ErrorCode::AlreadyRunning, "Pending writes must drain before starting TLS");
+                if (callback) {
+                    callback(false, "Pending writes must drain before starting TLS");
+                }
+                return false;
+            }
+        }
+
+        sslConfig_ = sslConfig;
+        sslConfig_.enableSSL = true;
+        if (sslConfig_.hostnameVerification.empty()) {
+            const std::string normalizedHost = remoteAddress_.normalizedHost();
+            if (!normalizedHost.empty()) {
+                sslConfig_.hostnameVerification = normalizedHost;
+            }
+        }
+
+        pendingTlsCallback_ = callback;
+        tlsUpgradeInProgress_ = true;
+        clearLastFailure();
+        stopReadTimer();
+        stopWriteTimer();
+
+        if (!initializeTls()) {
+            const Error lastError = getLastError();
+            const std::string message =
+                lastError.isFailure() ? lastError.toString() : "TLS initialization failed";
+            notifyTlsUpgrade(false, message);
+            releaseTls();
+            closeWithReason(message);
+            return false;
+        }
+
+        if (!driveTlsHandshake()) {
+            const Error lastError = getLastError();
+            const std::string message =
+                lastError.isFailure() ? lastError.toString() : "TLS handshake failed";
+            notifyHandshakeFailure(message);
+            closeWithReason(message);
+            return false;
+        }
+        return true;
+    }
+
     void disconnect() {
         if (running_.load(std::memory_order_acquire) &&
             !connected_.load(std::memory_order_acquire) &&
             pendingConnectCallback_) {
             notifyConnect(false, "Connection cancelled");
+        }
+        if (running_.load(std::memory_order_acquire) &&
+            tlsUpgradeInProgress_ &&
+            pendingTlsCallback_) {
+            notifyTlsUpgrade(false, "Connection cancelled");
         }
         closeWithReason("Connection closed");
     }
@@ -570,10 +640,30 @@ private:
         }
     }
 
+    void notifyTlsUpgrade(bool success, const std::string& message) {
+        tlsUpgradeInProgress_ = false;
+        if (pendingTlsCallback_) {
+            auto callback = std::exchange(pendingTlsCallback_, nullptr);
+            callback(success, message);
+        }
+    }
+
+    void notifyHandshakeFailure(const std::string& message) {
+        if (tlsUpgradeInProgress_) {
+            notifyTlsUpgrade(false, message);
+            return;
+        }
+        notifyConnect(false, message);
+    }
+
     void markConnected() {
         stopConnectTimer();
         connected_.store(true, std::memory_order_release);
         armReadTimer();
+        if (tlsUpgradeInProgress_) {
+            notifyTlsUpgrade(true, "");
+            return;
+        }
         notifyConnect(true, "");
     }
 
@@ -585,6 +675,8 @@ private:
         remoteAddress_ = {};
         clearLastFailure();
         tlsState_ = TlsState::Disabled;
+        tlsUpgradeInProgress_ = false;
+        pendingTlsCallback_ = nullptr;
         stopAllTimers();
         clearQueuesAndWaits();
         releaseTls();
@@ -639,6 +731,9 @@ private:
 
     void closeWithReason(const std::string& reason) {
         std::lock_guard<std::recursive_mutex> callbackLock(callbackMutex_);
+        if (tlsUpgradeInProgress_ && pendingTlsCallback_) {
+            notifyTlsUpgrade(false, reason);
+        }
         if (!running_.exchange(false, std::memory_order_acq_rel)) {
             stopAllTimers();
 #ifdef _WIN32
@@ -687,7 +782,7 @@ private:
                 const Error lastError = getLastError();
                 const std::string failureMessage =
                     lastError.isFailure() ? lastError.toString() : "TLS handshake failed";
-                notifyConnect(false, failureMessage);
+                notifyHandshakeFailure(failureMessage);
                 handleTransportFailure(lastError.getCode(), failureMessage);
             }
             return;
@@ -764,7 +859,7 @@ private:
                 const Error lastError = getLastError();
                 const std::string failureMessage =
                     lastError.isFailure() ? lastError.toString() : "TLS handshake failed";
-                notifyConnect(false, failureMessage);
+                notifyHandshakeFailure(failureMessage);
                 handleTransportFailure(lastError.getCode(), failureMessage);
             }
             return;
@@ -1292,7 +1387,7 @@ private:
                     const Error lastError = getLastError();
                     const std::string failureMessage =
                         lastError.isFailure() ? lastError.toString() : "TLS handshake failed";
-                    notifyConnect(false, failureMessage);
+                    notifyHandshakeFailure(failureMessage);
                     handleTransportFailure(lastError.getCode(), failureMessage);
                     return;
                 }
@@ -1438,7 +1533,7 @@ private:
                     const Error lastError = getLastError();
                     const std::string failureMessage =
                         lastError.isFailure() ? lastError.toString() : "TLS handshake failed";
-                    notifyConnect(false, failureMessage);
+                    notifyHandshakeFailure(failureMessage);
                     handleTransportFailure(lastError.getCode(), failureMessage);
                     return;
                 }
@@ -1920,6 +2015,7 @@ private:
 
     ConnectCallback connectCallback_;
     ConnectCallback pendingConnectCallback_;
+    ConnectCallback pendingTlsCallback_;
     DisconnectCallback disconnectCallback_;
     DataReceivedCallback dataReceivedCallback_;
     OwnedDataReceivedCallback ownedDataReceivedCallback_;
@@ -1939,6 +2035,7 @@ private:
     WaitDirection writeWait_ = WaitDirection::None;
     WaitDirection handshakeWait_ = WaitDirection::None;
     TlsState tlsState_ = TlsState::Disabled;
+    bool tlsUpgradeInProgress_ = false;
     SSLConfig sslConfig_;
     SSLContext sslContext_;
     ErrorCode lastFailureCode_ = ErrorCode::Success;
@@ -1980,6 +2077,10 @@ bool TcpClient::connect(const Address& remoteAddress,
                         const ConnectCallback& callback,
                         const SSLConfig& sslConfig) {
     return impl_->connect(remoteAddress.host(), remoteAddress.port, callback, sslConfig);
+}
+
+bool TcpClient::startTls(const SSLConfig& sslConfig, const ConnectCallback& callback) {
+    return impl_->startTls(sslConfig, callback);
 }
 
 void TcpClient::disconnect() {

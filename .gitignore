@@ -1,10 +1,25 @@
 # FastNet项目Git忽略文件
 
+*.*
+!.gitignore
+!*.bat
+!*.c
+!*.cc
+!*.cpp
+!*.h
+!*.hpp
+!*.in
+!*.md
+!*.txt
+!CMakeLists.txt
+!cmake/
+!cmake/**
 # 构建目录
 build/
 cmake-build-*/
 out/
 tmp/
+bin/
 
 # Visual Studio
 .vs/

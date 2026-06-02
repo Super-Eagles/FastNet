@@ -3,6 +3,7 @@
  * @brief FastNet UDP socket implementation
  */
 #include "UdpSocket.h"
+#include "EventPoller.h"
 
 #include "SocketWrapper.h"
 

@@ -3,6 +3,7 @@
  * @brief FastNet TCP client implementation
  */
 #include "TcpClient.h"
+#include "EventPoller.h"
 
 #include "Error.h"
 #include "MemoryPool.h"

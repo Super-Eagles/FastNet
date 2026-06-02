@@ -3,6 +3,7 @@
  * @brief FastNet TCP server implementation
  */
 #include "TcpServer.h"
+#include "EventPoller.h"
 
 #include "Error.h"
 #include "MemoryPool.h"

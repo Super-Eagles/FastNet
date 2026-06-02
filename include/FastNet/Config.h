@@ -45,6 +45,12 @@
     #else
         #define FASTNET_API __declspec(dllimport)
     #endif
+
+    // Suppress MSVC compiler warnings on DLL export interface for STL templates
+    #ifdef _MSC_VER
+        #pragma warning(disable: 4251) // STL member not exported
+        #pragma warning(disable: 4275) // base class std::runtime_error not exported
+    #endif
 #else
     #define FASTNET_API
 #endif

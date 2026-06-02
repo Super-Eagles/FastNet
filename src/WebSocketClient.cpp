@@ -463,7 +463,9 @@ private:
 
             Buffer payload;
             WSFrameMetadata metadata;
-            if (!WebSocketProtocol::decodeFrame(pending.substr(0, frameSize), payload, metadata) || !metadata.final) {
+            if (!WebSocketProtocol::decodeFrame(pending.substr(0, frameSize), payload, metadata) ||
+                !metadata.final ||
+                metadata.masked) {
                 handleError(Error(ErrorCode::WebSocketFrameError, "Invalid WebSocket frame"));
                 tcpClient_.disconnect();
                 return;

@@ -16,6 +16,7 @@
 !cmake/**
 # 构建目录
 build/
+build-*/
 cmake-build-*/
 out/
 tmp/

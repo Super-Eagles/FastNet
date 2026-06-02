@@ -153,7 +153,7 @@ std::string buildClientRequest(std::string_view method,
                                std::string_view hostHeader,
                                bool useCompression) {
     const RequestHeaderState state = scanRequestHeaders(headers);
-    const bool addContentLength = !state.hasContentLength && (!state.hasTransferEncoding || !body.empty());
+    const bool addContentLength = !state.hasContentLength && !state.hasTransferEncoding;
     const bool advertiseCompression = useCompression && supportsCompressedResponseDecoding();
 
     size_t reserveBytes = method.size() + path.size() + body.size() + state.serializedBytes + 16;

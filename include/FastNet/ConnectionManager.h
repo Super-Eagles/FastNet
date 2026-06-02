@@ -5,23 +5,20 @@
 #pragma once
 
 #include "Config.h"
-#include "Configuration.h"
 
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <string_view>
-#include <thread>
-#include <unordered_map>
 #include <vector>
 
 namespace FastNet {
+
+class Configuration;
+
+#pragma warning(push)
+#pragma warning(disable: 4251)
 
 struct ConnectionInfo {
     ConnectionId id = 0;
@@ -88,6 +85,8 @@ struct ServicePoolStats {
     CircuitBreakerStats circuitBreaker;
 };
 
+#pragma warning(pop)
+
 class FASTNET_API ConnectionManager {
 public:
     explicit ConnectionManager(const Configuration& config);
@@ -129,52 +128,8 @@ public:
     void reportExecution(const std::string& service, bool success);
 
 private:
-    struct ServiceState {
-        std::vector<BackendServer> backends;
-        std::deque<ConnectionId> idleConnections;
-        LoadBalancingStrategy strategy = LoadBalancingStrategy::RoundRobin;
-        CircuitBreakerStats circuitBreaker;
-        size_t roundRobinIndex   = 0;
-        size_t maxPoolSize       = 0;
-        size_t pendingRequests   = 0;
-        // O(1) connection count — incremented in createConnectionLocked,
-        // decremented in removeConnectionLocked.  Replaces the O(N) scan
-        // of connections_ that getServiceConnectionCountLocked() used to do.
-        size_t totalConnections  = 0;
-    };
-
-
-    ServiceState& ensureServiceStateLocked(const std::string& service);
-    ConnectionId createConnectionLocked(const std::string& service,
-                                        BackendServer& backend,
-                                        std::chrono::steady_clock::time_point now);
-    std::unordered_map<ConnectionId, ConnectionInfo>::iterator removeConnectionLocked(
-        std::unordered_map<ConnectionId, ConnectionInfo>::iterator it);
-    void cleanupExpiredConnectionsLocked(std::chrono::steady_clock::time_point now);
-    void performHealthCheckLocked(std::chrono::steady_clock::time_point now);
-    void pruneIdleConnectionsLocked(ServiceState& serviceState);
-    BackendServer* selectBackendLocked(ServiceState& serviceState, std::string_view affinityKey);
-    bool prepareCircuitBreakerLocked(ServiceState& serviceState, std::chrono::steady_clock::time_point now);
-    size_t getServiceConnectionCountLocked(std::string_view service) const;
-    static size_t getActiveConnectionCountLocked(const ServiceState& serviceState);
-    static LoadBalancingStrategy parseStrategy(std::string_view strategyName);
-    void maintenanceLoop();
-
-    Configuration config_;
-    mutable std::mutex mutex_;
-    std::unordered_map<ConnectionId, ConnectionInfo> connections_;
-    std::unordered_map<std::string, ServiceState> services_;
-    std::atomic<ConnectionId> nextConnectionId_{1};
-    std::atomic<bool> running_{false};
-    std::thread maintenanceThread_;
-    std::condition_variable maintenanceCondition_;
-    size_t pendingRequests_ = 0;
-    std::chrono::milliseconds idleTimeout_;
-    std::chrono::milliseconds healthCheckInterval_;
-    std::chrono::milliseconds recoveryTimeout_;
-    bool circuitBreakerEnabled_ = true;
-    size_t failureThreshold_ = 5;
-    size_t halfOpenAttempts_ = 3;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 } // namespace FastNet

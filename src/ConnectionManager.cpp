@@ -3,10 +3,17 @@
  * @brief FastNet service-level connection manager
  */
 #include "ConnectionManager.h"
+#include "Configuration.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <random>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 
 namespace FastNet {
@@ -80,14 +87,292 @@ bool backendMatchesConnection(const BackendServer& backend, const ConnectionInfo
 
 } // namespace
 
+struct ConnectionManager::Impl {
+    struct ServiceState {
+        std::vector<BackendServer> backends;
+        std::deque<ConnectionId> idleConnections;
+        LoadBalancingStrategy strategy = LoadBalancingStrategy::RoundRobin;
+        CircuitBreakerStats circuitBreaker;
+        size_t roundRobinIndex   = 0;
+        size_t maxPoolSize       = 0;
+        size_t pendingRequests   = 0;
+        size_t totalConnections  = 0;
+    };
+
+    Configuration config;
+    mutable std::mutex mutex;
+    std::unordered_map<ConnectionId, ConnectionInfo> connections;
+    std::unordered_map<std::string, ServiceState> services;
+    std::atomic<ConnectionId> nextConnectionId{1};
+    std::atomic<bool> running{false};
+    std::thread maintenanceThread;
+    std::condition_variable maintenanceCondition;
+    size_t pendingRequests = 0;
+    std::chrono::milliseconds idleTimeout;
+    std::chrono::milliseconds healthCheckInterval;
+    std::chrono::milliseconds recoveryTimeout;
+    bool circuitBreakerEnabled = true;
+    size_t failureThreshold = 5;
+    size_t halfOpenAttempts = 3;
+
+    explicit Impl(const Configuration& cfg)
+        : config(cfg),
+          idleTimeout(config.getInt(Configuration::Option::ConnectionTimeout, 30000)),
+          healthCheckInterval(config.getInt(Configuration::Option::HealthCheckInterval, 30000)),
+          recoveryTimeout(config.getInt(Configuration::Option::RecoveryTimeout, 60000)),
+          circuitBreakerEnabled(config.getBool(Configuration::Option::CircuitBreakerEnabled, true)),
+          failureThreshold(static_cast<size_t>(std::max(1, config.getInt(Configuration::Option::FailureThreshold, 5)))),
+          halfOpenAttempts(static_cast<size_t>(std::max(1, config.getInt(Configuration::Option::HalfOpenAttempts, 3)))) {}
+
+    ServiceState& ensureServiceStateLocked(const std::string& service) {
+        ServiceState& serviceState = services[service];
+        if (serviceState.maxPoolSize == 0) {
+            serviceState.maxPoolSize =
+                static_cast<size_t>(std::max(1, config.getInt(Configuration::Option::MaxConnections, 1024)));
+            serviceState.strategy =
+                parseStrategy(config.getString(Configuration::Option::LoadBalancingStrategy, "RoundRobin"));
+        }
+        return serviceState;
+    }
+
+    ConnectionId createConnectionLocked(const std::string& service,
+                                        BackendServer& backend,
+                                        std::chrono::steady_clock::time_point now) {
+        ConnectionInfo info;
+        info.id = nextConnectionId.fetch_add(1, std::memory_order_relaxed);
+        info.service = service;
+        info.remoteHost = backend.host;
+        info.remotePort = backend.port;
+        info.createdAt = now;
+        info.lastUsed = now;
+        info.isActive = true;
+
+        ++backend.activeConnections;
+        connections[info.id] = info;
+
+        auto serviceIt = services.find(service);
+        if (serviceIt != services.end()) {
+            ++serviceIt->second.totalConnections;
+        }
+        return info.id;
+    }
+
+    std::unordered_map<ConnectionId, ConnectionInfo>::iterator removeConnectionLocked(
+        std::unordered_map<ConnectionId, ConnectionInfo>::iterator it) {
+        auto serviceIt = services.find(it->second.service);
+        if (serviceIt != services.end()) {
+            auto& serviceState = serviceIt->second;
+            serviceState.idleConnections.erase(
+                std::remove(serviceState.idleConnections.begin(), serviceState.idleConnections.end(), it->first),
+                serviceState.idleConnections.end());
+
+            auto backendIt = std::find_if(
+                serviceState.backends.begin(),
+                serviceState.backends.end(),
+                [&](const BackendServer& backend) {
+                    return backend.host == it->second.remoteHost && backend.port == it->second.remotePort;
+                });
+            if (backendIt != serviceState.backends.end() && it->second.isActive &&
+                backendIt->activeConnections > 0) {
+                --backendIt->activeConnections;
+            }
+            if (serviceState.totalConnections > 0) {
+                --serviceState.totalConnections;
+            }
+        }
+
+        return connections.erase(it);
+    }
+
+    void cleanupExpiredConnectionsLocked(std::chrono::steady_clock::time_point now) {
+        for (auto it = connections.begin(); it != connections.end();) {
+            if (it->second.isActive || idleTimeout.count() == 0 || now - it->second.lastUsed <= idleTimeout) {
+                ++it;
+                continue;
+            }
+
+            it = removeConnectionLocked(it);
+        }
+
+        for (auto& service : services) {
+            pruneIdleConnectionsLocked(service.second);
+        }
+    }
+
+    void performHealthCheckLocked(std::chrono::steady_clock::time_point now) {
+        for (auto& service : services) {
+            CircuitBreakerStats& breaker = service.second.circuitBreaker;
+            if (breaker.state == CircuitBreakerState::Open &&
+                (recoveryTimeout.count() == 0 || now - breaker.lastFailureTime >= recoveryTimeout)) {
+                breaker.state = CircuitBreakerState::HalfOpen;
+                breaker.successCount = 0;
+                breaker.timeoutCount = 0;
+            }
+
+            for (auto& backend : service.second.backends) {
+                if (!backend.healthy &&
+                    (recoveryTimeout.count() == 0 || now - backend.lastFailureTime >= recoveryTimeout)) {
+                    backend.healthy = true;
+                    backend.failureCount = 0;
+                    backend.currentWeight = 0;
+                }
+            }
+
+            pruneIdleConnectionsLocked(service.second);
+        }
+    }
+
+    void pruneIdleConnectionsLocked(ServiceState& serviceState) {
+        serviceState.idleConnections.erase(
+            std::remove_if(serviceState.idleConnections.begin(),
+                           serviceState.idleConnections.end(),
+                           [this](ConnectionId id) {
+                               auto it = connections.find(id);
+                               return it == connections.end() || it->second.isActive;
+                           }),
+            serviceState.idleConnections.end());
+    }
+
+    BackendServer* selectBackendLocked(ServiceState& serviceState, std::string_view affinityKey) {
+        std::vector<BackendServer*> healthyBackends;
+        healthyBackends.reserve(serviceState.backends.size());
+        for (auto& backend : serviceState.backends) {
+            if (backend.healthy) {
+                healthyBackends.push_back(&backend);
+            }
+        }
+
+        if (healthyBackends.empty()) {
+            return nullptr;
+        }
+
+        switch (serviceState.strategy) {
+            case LoadBalancingStrategy::Random: {
+                static thread_local std::mt19937 generator{std::random_device{}()};
+                std::uniform_int_distribution<size_t> distribution(0, healthyBackends.size() - 1);
+                return healthyBackends[distribution(generator)];
+            }
+            case LoadBalancingStrategy::LeastConnections: {
+                return *std::min_element(healthyBackends.begin(),
+                                         healthyBackends.end(),
+                                         [](const BackendServer* lhs, const BackendServer* rhs) {
+                                             if (lhs->activeConnections == rhs->activeConnections) {
+                                                 return lhs->weight > rhs->weight;
+                                             }
+                                             return lhs->activeConnections < rhs->activeConnections;
+                                         });
+            }
+            case LoadBalancingStrategy::WeightedRoundRobin: {
+                BackendServer* best = nullptr;
+                int totalWeight = 0;
+                for (BackendServer* backend : healthyBackends) {
+                    const int effectiveWeight = std::max(1, backend->weight);
+                    totalWeight += effectiveWeight;
+                    backend->currentWeight += effectiveWeight;
+                    if (best == nullptr || backend->currentWeight > best->currentWeight ||
+                        (backend->currentWeight == best->currentWeight &&
+                         backend->activeConnections < best->activeConnections)) {
+                        best = backend;
+                    }
+                }
+                if (best != nullptr) {
+                    best->currentWeight -= totalWeight;
+                }
+                return best;
+            }
+            case LoadBalancingStrategy::IPHash: {
+                if (affinityKey.empty()) {
+                    const size_t index = serviceState.roundRobinIndex++ % healthyBackends.size();
+                    return healthyBackends[index];
+                }
+                const size_t index = std::hash<std::string_view>{}(affinityKey) % healthyBackends.size();
+                return healthyBackends[index];
+            }
+            case LoadBalancingStrategy::RoundRobin:
+            default: {
+                const size_t index = serviceState.roundRobinIndex++ % healthyBackends.size();
+                return healthyBackends[index];
+            }
+        }
+    }
+
+    bool prepareCircuitBreakerLocked(ServiceState& serviceState, std::chrono::steady_clock::time_point now) {
+        if (!circuitBreakerEnabled) {
+            return true;
+        }
+
+        CircuitBreakerStats& breaker = serviceState.circuitBreaker;
+        if (breaker.state == CircuitBreakerState::Open) {
+            if (recoveryTimeout.count() > 0 && now - breaker.lastFailureTime < recoveryTimeout) {
+                return false;
+            }
+            breaker.state = CircuitBreakerState::HalfOpen;
+            breaker.successCount = 0;
+            breaker.timeoutCount = 0;
+        }
+
+        if (breaker.state == CircuitBreakerState::HalfOpen &&
+            getActiveConnectionCountLocked(serviceState) >= halfOpenAttempts) {
+            return false;
+        }
+
+        return true;
+    }
+
+    size_t getServiceConnectionCountLocked(std::string_view service) const {
+        const auto it = services.find(std::string(service));
+        if (it == services.end()) {
+            return 0;
+        }
+        return it->second.totalConnections;
+    }
+
+    static size_t getActiveConnectionCountLocked(const ServiceState& serviceState) {
+        size_t activeConnections = 0;
+        for (const auto& backend : serviceState.backends) {
+            activeConnections += backend.activeConnections;
+        }
+        return activeConnections;
+    }
+
+    static LoadBalancingStrategy parseStrategy(std::string_view strategyName) {
+        const std::string normalized = normalizeStrategyName(strategyName);
+        if (normalized == "random") {
+            return LoadBalancingStrategy::Random;
+        }
+        if (normalized == "leastconnections") {
+            return LoadBalancingStrategy::LeastConnections;
+        }
+        if (normalized == "weightedroundrobin") {
+            return LoadBalancingStrategy::WeightedRoundRobin;
+        }
+        if (normalized == "iphash") {
+            return LoadBalancingStrategy::IPHash;
+        }
+        return LoadBalancingStrategy::RoundRobin;
+    }
+
+    void maintenanceLoop() {
+        const auto interval =
+            healthCheckInterval.count() > 0 ? healthCheckInterval : std::chrono::milliseconds(1000);
+        while (running.load(std::memory_order_acquire)) {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (maintenanceCondition.wait_for(
+                    lock,
+                    interval,
+                    [this]() { return !running.load(std::memory_order_acquire); })) {
+                break;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            cleanupExpiredConnectionsLocked(now);
+            performHealthCheckLocked(now);
+        }
+    }
+};
+
 ConnectionManager::ConnectionManager(const Configuration& config)
-    : config_(config),
-      idleTimeout_(config_.getInt(Configuration::Option::ConnectionTimeout, 30000)),
-      healthCheckInterval_(config_.getInt(Configuration::Option::HealthCheckInterval, 30000)),
-      recoveryTimeout_(config_.getInt(Configuration::Option::RecoveryTimeout, 60000)),
-      circuitBreakerEnabled_(config_.getBool(Configuration::Option::CircuitBreakerEnabled, true)),
-      failureThreshold_(static_cast<size_t>(std::max(1, config_.getInt(Configuration::Option::FailureThreshold, 5)))),
-      halfOpenAttempts_(static_cast<size_t>(std::max(1, config_.getInt(Configuration::Option::HalfOpenAttempts, 3)))) {}
+    : impl_(std::make_unique<Impl>(config)) {}
 
 ConnectionManager::~ConnectionManager() {
     cleanup();
@@ -95,27 +380,27 @@ ConnectionManager::~ConnectionManager() {
 
 bool ConnectionManager::initialize() {
     bool expected = false;
-    if (!running_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    if (!impl_->running.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         return true;
     }
 
-    maintenanceThread_ = std::thread(&ConnectionManager::maintenanceLoop, this);
+    impl_->maintenanceThread = std::thread(&Impl::maintenanceLoop, impl_.get());
     return true;
 }
 
 void ConnectionManager::cleanup() {
-    const bool wasRunning = running_.exchange(false, std::memory_order_acq_rel);
+    const bool wasRunning = impl_->running.exchange(false, std::memory_order_acq_rel);
     if (wasRunning) {
-        maintenanceCondition_.notify_all();
-        if (maintenanceThread_.joinable()) {
-            maintenanceThread_.join();
+        impl_->maintenanceCondition.notify_all();
+        if (impl_->maintenanceThread.joinable()) {
+            impl_->maintenanceThread.join();
         }
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    connections_.clear();
-    services_.clear();
-    pendingRequests_ = 0;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->connections.clear();
+    impl_->services.clear();
+    impl_->pendingRequests = 0;
 }
 
 ConnectionId ConnectionManager::acquireConnection(const std::string& service) {
@@ -128,14 +413,14 @@ ConnectionId ConnectionManager::acquireConnection(const std::string& service,
         return 0;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    ServiceState& serviceState = ensureServiceStateLocked(service);
-    ++pendingRequests_;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    Impl::ServiceState& serviceState = impl_->ensureServiceStateLocked(service);
+    ++impl_->pendingRequests;
     ++serviceState.pendingRequests;
 
     const auto finish = [&](ConnectionId id) {
-        if (pendingRequests_ > 0) {
-            --pendingRequests_;
+        if (impl_->pendingRequests > 0) {
+            --impl_->pendingRequests;
         }
         if (serviceState.pendingRequests > 0) {
             --serviceState.pendingRequests;
@@ -144,7 +429,7 @@ ConnectionId ConnectionManager::acquireConnection(const std::string& service,
     };
 
     const auto now = std::chrono::steady_clock::now();
-    if (!prepareCircuitBreakerLocked(serviceState, now)) {
+    if (!impl_->prepareCircuitBreakerLocked(serviceState, now)) {
         return finish(0);
     }
 
@@ -152,8 +437,8 @@ ConnectionId ConnectionManager::acquireConnection(const std::string& service,
         const ConnectionId candidateId = serviceState.idleConnections.front();
         serviceState.idleConnections.pop_front();
 
-        const auto connectionIt = connections_.find(candidateId);
-        if (connectionIt == connections_.end()) {
+        const auto connectionIt = impl_->connections.find(candidateId);
+        if (connectionIt == impl_->connections.end()) {
             continue;
         }
 
@@ -161,8 +446,8 @@ ConnectionId ConnectionManager::acquireConnection(const std::string& service,
             continue;
         }
 
-        if (idleTimeout_.count() > 0 && now - connectionIt->second.lastUsed > idleTimeout_) {
-            removeConnectionLocked(connectionIt);
+        if (impl_->idleTimeout.count() > 0 && now - connectionIt->second.lastUsed > impl_->idleTimeout) {
+            impl_->removeConnectionLocked(connectionIt);
             continue;
         }
 
@@ -176,7 +461,7 @@ ConnectionId ConnectionManager::acquireConnection(const std::string& service,
                 return backendMatchesConnection(backend, connectionIt->second);
             });
         if (backendIt == serviceState.backends.end() || !backendIt->healthy) {
-            removeConnectionLocked(connectionIt);
+            impl_->removeConnectionLocked(connectionIt);
             continue;
         }
 
@@ -185,28 +470,28 @@ ConnectionId ConnectionManager::acquireConnection(const std::string& service,
         return finish(candidateId);
     }
 
-    if (getServiceConnectionCountLocked(service) >= serviceState.maxPoolSize) {
+    if (impl_->getServiceConnectionCountLocked(service) >= serviceState.maxPoolSize) {
         return finish(0);
     }
 
-    BackendServer* backend = selectBackendLocked(serviceState, affinityKey);
+    BackendServer* backend = impl_->selectBackendLocked(serviceState, affinityKey);
     if (backend == nullptr) {
         return finish(0);
     }
 
-    return finish(createConnectionLocked(service, *backend, now));
+    return finish(impl_->createConnectionLocked(service, *backend, now));
 }
 
 void ConnectionManager::releaseConnection(ConnectionId id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto connectionIt = connections_.find(id);
-    if (connectionIt == connections_.end() || !connectionIt->second.isActive) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto connectionIt = impl_->connections.find(id);
+    if (connectionIt == impl_->connections.end() || !connectionIt->second.isActive) {
         return;
     }
 
-    auto serviceIt = services_.find(connectionIt->second.service);
-    if (serviceIt == services_.end()) {
-        removeConnectionLocked(connectionIt);
+    auto serviceIt = impl_->services.find(connectionIt->second.service);
+    if (serviceIt == impl_->services.end()) {
+        impl_->removeConnectionLocked(connectionIt);
         return;
     }
 
@@ -217,8 +502,8 @@ void ConnectionManager::releaseConnection(ConnectionId id) {
             return backendMatchesConnection(backend, connectionIt->second);
         });
     if (backendIt == serviceIt->second.backends.end() || !backendIt->healthy) {
-        removeConnectionLocked(connectionIt);
-        maintenanceCondition_.notify_one();
+        impl_->removeConnectionLocked(connectionIt);
+        impl_->maintenanceCondition.notify_one();
         return;
     }
 
@@ -230,28 +515,28 @@ void ConnectionManager::releaseConnection(ConnectionId id) {
         --backendIt->activeConnections;
     }
 
-    maintenanceCondition_.notify_one();
+    impl_->maintenanceCondition.notify_one();
 }
 
 void ConnectionManager::closeConnection(ConnectionId id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = connections_.find(id);
-    if (it == connections_.end()) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->connections.find(id);
+    if (it == impl_->connections.end()) {
         return;
     }
 
-    removeConnectionLocked(it);
-    maintenanceCondition_.notify_one();
+    impl_->removeConnectionLocked(it);
+    impl_->maintenanceCondition.notify_one();
 }
 
 ConnectionPoolStats ConnectionManager::getPoolStats() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
 
     ConnectionPoolStats stats;
-    stats.totalConnections = connections_.size();
-    stats.pendingRequests = pendingRequests_;
+    stats.totalConnections = impl_->connections.size();
+    stats.pendingRequests = impl_->pendingRequests;
 
-    for (const auto& entry : connections_) {
+    for (const auto& entry : impl_->connections) {
         if (entry.second.isActive) {
             ++stats.activeConnections;
         } else {
@@ -259,19 +544,19 @@ ConnectionPoolStats ConnectionManager::getPoolStats() const {
         }
     }
 
-    for (const auto& service : services_) {
+    for (const auto& service : impl_->services) {
         stats.maxConnections += service.second.maxPoolSize;
     }
     return stats;
 }
 
 ServicePoolStats ConnectionManager::getServiceStats(const std::string& service) const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
     ServicePoolStats stats;
     stats.service = service;
 
-    const auto serviceIt = services_.find(service);
-    if (serviceIt == services_.end()) {
+    const auto serviceIt = impl_->services.find(service);
+    if (serviceIt == impl_->services.end()) {
         return stats;
     }
 
@@ -285,7 +570,7 @@ ServicePoolStats ConnectionManager::getServiceStats(const std::string& service) 
         serviceIt->second.backends.end(),
         [](const BackendServer& backend) { return backend.healthy; });
 
-    for (const auto& entry : connections_) {
+    for (const auto& entry : impl_->connections) {
         if (entry.second.service != service) {
             continue;
         }
@@ -302,10 +587,10 @@ ServicePoolStats ConnectionManager::getServiceStats(const std::string& service) 
 }
 
 std::vector<std::string> ConnectionManager::getServices() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
     std::vector<std::string> names;
-    names.reserve(services_.size());
-    for (const auto& entry : services_) {
+    names.reserve(impl_->services.size());
+    for (const auto& entry : impl_->services) {
         names.push_back(entry.first);
     }
     std::sort(names.begin(), names.end());
@@ -313,9 +598,9 @@ std::vector<std::string> ConnectionManager::getServices() const {
 }
 
 std::vector<BackendServer> ConnectionManager::getBackendServers(const std::string& service) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = services_.find(service);
-    return it == services_.end() ? std::vector<BackendServer>() : it->second.backends;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->services.find(service);
+    return it == impl_->services.end() ? std::vector<BackendServer>() : it->second.backends;
 }
 
 void ConnectionManager::addBackendServer(const std::string& service,
@@ -326,8 +611,8 @@ void ConnectionManager::addBackendServer(const std::string& service,
         return;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    ServiceState& serviceState = ensureServiceStateLocked(service);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    Impl::ServiceState& serviceState = impl_->ensureServiceStateLocked(service);
     const auto it = std::find_if(serviceState.backends.begin(),
                                  serviceState.backends.end(),
                                  [&](const BackendServer& backend) {
@@ -351,9 +636,9 @@ void ConnectionManager::addBackendServer(const std::string& service,
 void ConnectionManager::removeBackendServer(const std::string& service,
                                             const std::string& host,
                                             uint16_t port) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto serviceIt = services_.find(service);
-    if (serviceIt == services_.end()) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto serviceIt = impl_->services.find(service);
+    if (serviceIt == impl_->services.end()) {
         return;
     }
 
@@ -362,18 +647,18 @@ void ConnectionManager::removeBackendServer(const std::string& service,
                                   backends.end(),
                                   [&](const BackendServer& backend) {
                                       return backend.host == host && backend.port == port;
-                                  }),
+                                    }),
                    backends.end());
     if (serviceIt->second.roundRobinIndex >= backends.size() && !backends.empty()) {
         serviceIt->second.roundRobinIndex %= backends.size();
     }
 
-    for (auto it = connections_.begin(); it != connections_.end();) {
+    for (auto it = impl_->connections.begin(); it != impl_->connections.end();) {
         if (it->second.service == service &&
             it->second.remoteHost == host &&
             it->second.remotePort == port &&
             !it->second.isActive) {
-            it = removeConnectionLocked(it);
+            it = impl_->removeConnectionLocked(it);
             continue;
         }
         ++it;
@@ -384,9 +669,9 @@ void ConnectionManager::updateBackendWeight(const std::string& service,
                                             const std::string& host,
                                             uint16_t port,
                                             int weight) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto serviceIt = services_.find(service);
-    if (serviceIt == services_.end()) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto serviceIt = impl_->services.find(service);
+    if (serviceIt == impl_->services.end()) {
         return;
     }
 
@@ -404,25 +689,25 @@ void ConnectionManager::updateBackendWeight(const std::string& service,
 }
 
 LoadBalancingStrategy ConnectionManager::getLoadBalancingStrategy(const std::string& service) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = services_.find(service);
-    if (it == services_.end()) {
-        return parseStrategy(config_.getString(Configuration::Option::LoadBalancingStrategy, "RoundRobin"));
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->services.find(service);
+    if (it == impl_->services.end()) {
+        return Impl::parseStrategy(impl_->config.getString(Configuration::Option::LoadBalancingStrategy, "RoundRobin"));
     }
     return it->second.strategy;
 }
 
 void ConnectionManager::setLoadBalancingStrategy(const std::string& service,
                                                  LoadBalancingStrategy strategy) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    ServiceState& serviceState = ensureServiceStateLocked(service);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    Impl::ServiceState& serviceState = impl_->ensureServiceStateLocked(service);
     serviceState.strategy = strategy;
 }
 
 CircuitBreakerStats ConnectionManager::getCircuitBreakerStats(const std::string& service) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = services_.find(service);
-    return it == services_.end() ? CircuitBreakerStats() : it->second.circuitBreaker;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->services.find(service);
+    return it == impl_->services.end() ? CircuitBreakerStats() : it->second.circuitBreaker;
 }
 
 void ConnectionManager::reportBackendStatus(const std::string& host, uint16_t port, bool success) {
@@ -430,20 +715,20 @@ void ConnectionManager::reportBackendStatus(const std::string& host, uint16_t po
         return;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
     const auto now = std::chrono::steady_clock::now();
-    for (auto& service : services_) {
+    for (auto& service : impl_->services) {
         for (auto& backend : service.second.backends) {
             if (backend.host == host && backend.port == port) {
                 const bool wasHealthy = backend.healthy;
-                applyBackendStatus(backend, success, failureThreshold_, now);
+                applyBackendStatus(backend, success, impl_->failureThreshold, now);
                 if (wasHealthy && !backend.healthy) {
-                    for (auto it = connections_.begin(); it != connections_.end();) {
+                    for (auto it = impl_->connections.begin(); it != impl_->connections.end();) {
                         if (it->second.service == service.first &&
                             it->second.remoteHost == host &&
                             it->second.remotePort == port &&
                             !it->second.isActive) {
-                            it = removeConnectionLocked(it);
+                            it = impl_->removeConnectionLocked(it);
                             continue;
                         }
                         ++it;
@@ -462,9 +747,9 @@ void ConnectionManager::reportBackendStatus(const std::string& service,
         return;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto serviceIt = services_.find(service);
-    if (serviceIt == services_.end()) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto serviceIt = impl_->services.find(service);
+    if (serviceIt == impl_->services.end()) {
         return;
     }
 
@@ -472,14 +757,14 @@ void ConnectionManager::reportBackendStatus(const std::string& service,
     for (auto& backend : serviceIt->second.backends) {
         if (backend.host == host && backend.port == port) {
             const bool wasHealthy = backend.healthy;
-            applyBackendStatus(backend, success, failureThreshold_, now);
+            applyBackendStatus(backend, success, impl_->failureThreshold, now);
             if (wasHealthy && !backend.healthy) {
-                for (auto it = connections_.begin(); it != connections_.end();) {
+                for (auto it = impl_->connections.begin(); it != impl_->connections.end();) {
                     if (it->second.service == service &&
                         it->second.remoteHost == host &&
                         it->second.remotePort == port &&
                         !it->second.isActive) {
-                        it = removeConnectionLocked(it);
+                        it = impl_->removeConnectionLocked(it);
                         continue;
                     }
                     ++it;
@@ -491,283 +776,31 @@ void ConnectionManager::reportBackendStatus(const std::string& service,
 }
 
 void ConnectionManager::reportExecution(bool success) {
-    if (!circuitBreakerEnabled_) {
+    if (!impl_->circuitBreakerEnabled) {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
     const auto now = std::chrono::steady_clock::now();
-    for (auto& service : services_) {
+    for (auto& service : impl_->services) {
         applyExecutionResult(
-            service.second.circuitBreaker, success, failureThreshold_, halfOpenAttempts_, now);
+            service.second.circuitBreaker, success, impl_->failureThreshold, impl_->halfOpenAttempts, now);
     }
 }
 
 void ConnectionManager::reportExecution(const std::string& service, bool success) {
-    if (!circuitBreakerEnabled_) {
+    if (!impl_->circuitBreakerEnabled) {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = services_.find(service);
-    if (it == services_.end()) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->services.find(service);
+    if (it == impl_->services.end()) {
         return;
     }
 
     applyExecutionResult(
-        it->second.circuitBreaker, success, failureThreshold_, halfOpenAttempts_, std::chrono::steady_clock::now());
-}
-
-ConnectionManager::ServiceState& ConnectionManager::ensureServiceStateLocked(const std::string& service) {
-    ServiceState& serviceState = services_[service];
-    if (serviceState.maxPoolSize == 0) {
-        serviceState.maxPoolSize =
-            static_cast<size_t>(std::max(1, config_.getInt(Configuration::Option::MaxConnections, 1024)));
-        serviceState.strategy =
-            parseStrategy(config_.getString(Configuration::Option::LoadBalancingStrategy, "RoundRobin"));
-    }
-    return serviceState;
-}
-
-ConnectionId ConnectionManager::createConnectionLocked(const std::string& service,
-                                                       BackendServer& backend,
-                                                       std::chrono::steady_clock::time_point now) {
-    ConnectionInfo info;
-    info.id = nextConnectionId_.fetch_add(1, std::memory_order_relaxed);
-    info.service = service;
-    info.remoteHost = backend.host;
-    info.remotePort = backend.port;
-    info.createdAt = now;
-    info.lastUsed = now;
-    info.isActive = true;
-
-    ++backend.activeConnections;
-    connections_[info.id] = info;
-
-    // Maintain O(1) per-service connection counter to avoid O(N) scans
-    // in getServiceConnectionCountLocked on every acquireConnection().
-    auto serviceIt = services_.find(service);
-    if (serviceIt != services_.end()) {
-        ++serviceIt->second.totalConnections;
-    }
-    return info.id;
-}
-
-std::unordered_map<ConnectionId, ConnectionInfo>::iterator ConnectionManager::removeConnectionLocked(
-    std::unordered_map<ConnectionId, ConnectionInfo>::iterator it) {
-    auto serviceIt = services_.find(it->second.service);
-    if (serviceIt != services_.end()) {
-        auto& serviceState = serviceIt->second;
-        serviceState.idleConnections.erase(
-            std::remove(serviceState.idleConnections.begin(), serviceState.idleConnections.end(), it->first),
-            serviceState.idleConnections.end());
-
-        auto backendIt = std::find_if(
-            serviceState.backends.begin(),
-            serviceState.backends.end(),
-            [&](const BackendServer& backend) {
-                return backend.host == it->second.remoteHost && backend.port == it->second.remotePort;
-            });
-        if (backendIt != serviceState.backends.end() && it->second.isActive &&
-            backendIt->activeConnections > 0) {
-            --backendIt->activeConnections;
-        }
-        // Keep the O(1) totalConnections counter in sync.
-        if (serviceState.totalConnections > 0) {
-            --serviceState.totalConnections;
-        }
-    }
-
-    return connections_.erase(it);
-}
-
-void ConnectionManager::cleanupExpiredConnectionsLocked(std::chrono::steady_clock::time_point now) {
-    for (auto it = connections_.begin(); it != connections_.end();) {
-        if (it->second.isActive || idleTimeout_.count() == 0 || now - it->second.lastUsed <= idleTimeout_) {
-            ++it;
-            continue;
-        }
-
-        it = removeConnectionLocked(it);
-    }
-
-    for (auto& service : services_) {
-        pruneIdleConnectionsLocked(service.second);
-    }
-}
-
-void ConnectionManager::performHealthCheckLocked(std::chrono::steady_clock::time_point now) {
-    for (auto& service : services_) {
-        CircuitBreakerStats& breaker = service.second.circuitBreaker;
-        if (breaker.state == CircuitBreakerState::Open &&
-            (recoveryTimeout_.count() == 0 || now - breaker.lastFailureTime >= recoveryTimeout_)) {
-            breaker.state = CircuitBreakerState::HalfOpen;
-            breaker.successCount = 0;
-            breaker.timeoutCount = 0;
-        }
-
-        for (auto& backend : service.second.backends) {
-            if (!backend.healthy &&
-                (recoveryTimeout_.count() == 0 || now - backend.lastFailureTime >= recoveryTimeout_)) {
-                backend.healthy = true;
-                backend.failureCount = 0;
-                backend.currentWeight = 0;
-            }
-        }
-
-        pruneIdleConnectionsLocked(service.second);
-    }
-}
-
-void ConnectionManager::pruneIdleConnectionsLocked(ServiceState& serviceState) {
-    serviceState.idleConnections.erase(
-        std::remove_if(serviceState.idleConnections.begin(),
-                       serviceState.idleConnections.end(),
-                       [this](ConnectionId id) {
-                           auto it = connections_.find(id);
-                           return it == connections_.end() || it->second.isActive;
-                       }),
-        serviceState.idleConnections.end());
-}
-
-BackendServer* ConnectionManager::selectBackendLocked(ServiceState& serviceState,
-                                                      std::string_view affinityKey) {
-    std::vector<BackendServer*> healthyBackends;
-    healthyBackends.reserve(serviceState.backends.size());
-    for (auto& backend : serviceState.backends) {
-        if (backend.healthy) {
-            healthyBackends.push_back(&backend);
-        }
-    }
-
-    if (healthyBackends.empty()) {
-        return nullptr;
-    }
-
-    switch (serviceState.strategy) {
-        case LoadBalancingStrategy::Random: {
-            static thread_local std::mt19937 generator{std::random_device{}()};
-            std::uniform_int_distribution<size_t> distribution(0, healthyBackends.size() - 1);
-            return healthyBackends[distribution(generator)];
-        }
-        case LoadBalancingStrategy::LeastConnections: {
-            return *std::min_element(healthyBackends.begin(),
-                                     healthyBackends.end(),
-                                     [](const BackendServer* lhs, const BackendServer* rhs) {
-                                         if (lhs->activeConnections == rhs->activeConnections) {
-                                             return lhs->weight > rhs->weight;
-                                         }
-                                         return lhs->activeConnections < rhs->activeConnections;
-                                     });
-        }
-        case LoadBalancingStrategy::WeightedRoundRobin: {
-            BackendServer* best = nullptr;
-            int totalWeight = 0;
-            for (BackendServer* backend : healthyBackends) {
-                const int effectiveWeight = std::max(1, backend->weight);
-                totalWeight += effectiveWeight;
-                backend->currentWeight += effectiveWeight;
-                if (best == nullptr || backend->currentWeight > best->currentWeight ||
-                    (backend->currentWeight == best->currentWeight &&
-                     backend->activeConnections < best->activeConnections)) {
-                    best = backend;
-                }
-            }
-            if (best != nullptr) {
-                best->currentWeight -= totalWeight;
-            }
-            return best;
-        }
-        case LoadBalancingStrategy::IPHash: {
-            if (affinityKey.empty()) {
-                const size_t index = serviceState.roundRobinIndex++ % healthyBackends.size();
-                return healthyBackends[index];
-            }
-            const size_t index = std::hash<std::string_view>{}(affinityKey) % healthyBackends.size();
-            return healthyBackends[index];
-        }
-        case LoadBalancingStrategy::RoundRobin:
-        default: {
-            const size_t index = serviceState.roundRobinIndex++ % healthyBackends.size();
-            return healthyBackends[index];
-        }
-    }
-}
-
-bool ConnectionManager::prepareCircuitBreakerLocked(ServiceState& serviceState,
-                                                    std::chrono::steady_clock::time_point now) {
-    if (!circuitBreakerEnabled_) {
-        return true;
-    }
-
-    CircuitBreakerStats& breaker = serviceState.circuitBreaker;
-    if (breaker.state == CircuitBreakerState::Open) {
-        if (recoveryTimeout_.count() > 0 && now - breaker.lastFailureTime < recoveryTimeout_) {
-            return false;
-        }
-        breaker.state = CircuitBreakerState::HalfOpen;
-        breaker.successCount = 0;
-        breaker.timeoutCount = 0;
-    }
-
-    if (breaker.state == CircuitBreakerState::HalfOpen &&
-        getActiveConnectionCountLocked(serviceState) >= halfOpenAttempts_) {
-        return false;
-    }
-
-    return true;
-}
-
-size_t ConnectionManager::getServiceConnectionCountLocked(std::string_view service) const {
-    // O(1): read the per-service counter instead of scanning all connections.
-    const auto it = services_.find(std::string(service));
-    if (it == services_.end()) {
-        return 0;
-    }
-    return it->second.totalConnections;
-}
-
-size_t ConnectionManager::getActiveConnectionCountLocked(const ServiceState& serviceState) {
-    size_t activeConnections = 0;
-    for (const auto& backend : serviceState.backends) {
-        activeConnections += backend.activeConnections;
-    }
-    return activeConnections;
-}
-
-LoadBalancingStrategy ConnectionManager::parseStrategy(std::string_view strategyName) {
-    const std::string normalized = normalizeStrategyName(strategyName);
-    if (normalized == "random") {
-        return LoadBalancingStrategy::Random;
-    }
-    if (normalized == "leastconnections") {
-        return LoadBalancingStrategy::LeastConnections;
-    }
-    if (normalized == "weightedroundrobin") {
-        return LoadBalancingStrategy::WeightedRoundRobin;
-    }
-    if (normalized == "iphash") {
-        return LoadBalancingStrategy::IPHash;
-    }
-    return LoadBalancingStrategy::RoundRobin;
-}
-
-void ConnectionManager::maintenanceLoop() {
-    const auto interval =
-        healthCheckInterval_.count() > 0 ? healthCheckInterval_ : std::chrono::milliseconds(1000);
-    while (running_.load(std::memory_order_acquire)) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (maintenanceCondition_.wait_for(
-                lock,
-                interval,
-                [this]() { return !running_.load(std::memory_order_acquire); })) {
-            break;
-        }
-
-        const auto now = std::chrono::steady_clock::now();
-        cleanupExpiredConnectionsLocked(now);
-        performHealthCheckLocked(now);
-    }
+        it->second.circuitBreaker, success, impl_->failureThreshold, impl_->halfOpenAttempts, std::chrono::steady_clock::now());
 }
 
 } // namespace FastNet

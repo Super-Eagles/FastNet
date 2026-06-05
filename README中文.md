@@ -1,5 +1,7 @@
 # FastNet
 
+[English](README.md)
+
 FastNet 是一个 C++17 网络库，当前代码已经覆盖 TCP、UDP、HTTP、WebSocket、TLS、连接管理、配置、日志、监控和错误模型。仓库里的重点不只是“能编译”，而是把运行时、协议层和验证路径整理到可以持续回归的状态。
 
 ## 项目结构
@@ -15,11 +17,11 @@ FastNet 是一个 C++17 网络库，当前代码已经覆盖 TCP、UDP、HTTP、
 
 建议按这个顺序看：
 
-1. [docs/USER_GUIDE.md](docs/USER_GUIDE.md): 模块选择、生命周期、最小用法
-2. [docs/COOKBOOK.md](docs/COOKBOOK.md): 按任务组织的落地配方
-3. [docs/API_REFERENCE.md](docs/API_REFERENCE.md): 公开类和方法速查
-4. [docs/VALIDATION_CHECKLIST.md](docs/VALIDATION_CHECKLIST.md): 构建、测试、联调和压测步骤
-5. [docs/RELEASE_STATUS.md](docs/RELEASE_STATUS.md): 当前已经完成的验证和保留边界
+1. [docs/zh/USER_GUIDE.md](docs/zh/USER_GUIDE.md): 模块选择、生命周期、最小用法
+2. [docs/zh/COOKBOOK.md](docs/zh/COOKBOOK.md): 按任务组织的落地配方
+3. [docs/zh/API_REFERENCE.md](docs/zh/API_REFERENCE.md): 公开类和方法速查
+4. [docs/zh/VALIDATION_CHECKLIST.md](docs/zh/VALIDATION_CHECKLIST.md): 构建、测试、联调和压测步骤
+5. [docs/zh/RELEASE_STATUS.md](docs/zh/RELEASE_STATUS.md): 当前已经完成的验证和保留边界
 
 ## 能力概览
 

@@ -5,6 +5,8 @@
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 [![Version](https://img.shields.io/badge/version-1.4.0-green.svg)](CMakeLists.txt)
 
+[中文版](README中文.md)
+
 A production-grade, cross-platform C++17 networking library covering **TCP, UDP, HTTP/1.1, WebSocket, TLS, connection pooling, multi-backend management, logging, and performance monitoring** — all built on a unified async I/O engine.
 
 ---
@@ -195,11 +197,11 @@ Full list of examples in [`examples/`](examples/).
 
 | Document | Contents |
 |---|---|
-| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Module selection, lifecycle, minimal usage patterns |
-| [docs/COOKBOOK.md](docs/COOKBOOK.md) | Task-oriented recipes |
-| [docs/API_REFERENCE.md](docs/API_REFERENCE.md) | Public classes and methods |
-| [docs/VALIDATION_CHECKLIST.md](docs/VALIDATION_CHECKLIST.md) | Build, test, and benchmark checklist |
-| [docs/RELEASE_STATUS.md](docs/RELEASE_STATUS.md) | Verified configurations and known boundaries |
+| [docs/en/USER_GUIDE.md](docs/en/USER_GUIDE.md) | Module selection, lifecycle, minimal usage patterns |
+| [docs/en/COOKBOOK.md](docs/en/COOKBOOK.md) | Task-oriented recipes |
+| [docs/en/API_REFERENCE.md](docs/en/API_REFERENCE.md) | Public classes and methods |
+| [docs/en/VALIDATION_CHECKLIST.md](docs/en/VALIDATION_CHECKLIST.md) | Build, test, and benchmark checklist |
+| [docs/en/RELEASE_STATUS.md](docs/en/RELEASE_STATUS.md) | Verified configurations and known boundaries |
 
 ---
 

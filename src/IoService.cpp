@@ -41,6 +41,7 @@ size_t normalizeThreadCount(size_t requested) {
 
 struct IoService::Impl {
     std::unique_ptr<EventPoller> poller;
+    std::thread                  pollerThread;
     std::vector<std::thread>     threads;
     size_t                       threadCount = 0;
 
@@ -147,17 +148,22 @@ struct IoService::Impl {
         }
     }
 
-    void workerThread(size_t workerIndex) {
-        const bool isPoller = (workerIndex == 0);
+    void pollerLoop() {
+        try {
+            while (running.load(std::memory_order_acquire)) {
+                drainMailbox();
+                poller->poll(kPollTimeoutMs);
+            }
+            drainMailbox();
+        } catch (...) {}
+    }
+
+    void workerThread() {
         std::vector<Task> batch;
         batch.reserve(kMailboxDrainBudget);
 
         try {
             while (true) {
-                if (isPoller) {
-                    drainMailbox();
-                }
-
                 takeSharedTasks(batch, kMailboxDrainBudget);
                 if (!batch.empty()) {
                     executeTasks(batch);
@@ -165,17 +171,10 @@ struct IoService::Impl {
                 }
 
                 if (!running.load(std::memory_order_acquire)) {
-                    if (isPoller) drainMailbox();
                     while (takeSharedTasks(batch, kMailboxDrainBudget) != 0) {
                         executeTasks(batch);
                     }
                     break;
-                }
-
-                if (isPoller) {
-                    poller->poll(kPollTimeoutMs);
-                    drainMailbox();
-                    continue;
                 }
 
                 {
@@ -213,14 +212,18 @@ bool IoService::start() {
     impl_->threads.reserve(impl_->threadCount);
 
     try {
+        impl_->pollerThread = std::thread([this]() { impl_->pollerLoop(); });
         for (size_t i = 0; i < impl_->threadCount; ++i) {
-            impl_->threads.emplace_back([this, i]() { impl_->workerThread(i); });
+            impl_->threads.emplace_back([this]() { impl_->workerThread(); });
         }
     } catch (...) {
         impl_->running.store(false, std::memory_order_release);
         impl_->started.store(false, std::memory_order_release);
         impl_->taskCond.notify_all();
         impl_->poller->wakeup();
+        if (impl_->pollerThread.joinable()) {
+            impl_->pollerThread.join();
+        }
         for (auto& t : impl_->threads) {
             if (t.joinable()) t.join();
         }
@@ -241,12 +244,15 @@ void IoService::stop() {
 void IoService::join() {
     stop();
 
+    std::thread pThread;
     std::vector<std::thread> toJoin;
     {
         std::lock_guard<std::mutex> lock(impl_->startMutex);
         if (!impl_->started.load(std::memory_order_acquire)) return;
+        pThread.swap(impl_->pollerThread);
         toJoin.swap(impl_->threads);
     }
+    if (pThread.joinable()) pThread.join();
     for (auto& t : toJoin) {
         if (t.joinable()) t.join();
     }

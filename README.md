@@ -1,135 +1,221 @@
 # FastNet
 
-FastNet 是一个 C++17 网络库，当前代码已经覆盖 TCP、UDP、HTTP、WebSocket、TLS、连接管理、配置、日志、监控和错误模型。仓库里的重点不只是“能编译”，而是把运行时、协议层和验证路径整理到可以持续回归的状态。
+[![CI](https://github.com/Super-Eagles/FastNet/actions/workflows/ci.yml/badge.svg)](https://github.com/Super-Eagles/FastNet/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/Super-Eagles/FastNet)](LICENSE)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
+[![Version](https://img.shields.io/badge/version-1.4.0-green.svg)](CMakeLists.txt)
 
-## 项目结构
+A production-grade, cross-platform C++17 networking library covering **TCP, UDP, HTTP/1.1, WebSocket, TLS, connection pooling, multi-backend management, logging, and performance monitoring** — all built on a unified async I/O engine.
 
-- `include/FastNet/`: 对外公开头文件
-- `src/`: 核心实现
-- `examples/`: 示例程序和 benchmark
-- `test/`: C++ 回归测试
-- `cmake/`: CMake package 配置模板
-- `docs/`: 用户指南、API 参考、验证清单和发布状态
+---
 
-## 文档入口
+## Features
 
-建议按这个顺序看：
+| Layer | Capabilities |
+|---|---|
+| **Transport** | TCP server/client, UDP send/receive, TLS via OpenSSL |
+| **Protocol** | HTTP/1.1 server & client, WebSocket server & client (text/binary/ping-pong/close handshake) |
+| **Connection Management** | `TcpConnectionPool` for upstream connection reuse; `ConnectionManager` for multi-backend routing and health tracking |
+| **Async Runtime** | `IoService` thread pool, `EventPoller` (epoll/IOCP), `TimerManager` |
+| **Observability** | Async file logger, `PerformanceMonitor`, rich `Error` model with source location |
+| **Cross-platform** | Windows (IOCP) + Linux (epoll), same CMake build |
 
-1. [docs/USER_GUIDE.md](docs/USER_GUIDE.md): 模块选择、生命周期、最小用法
-2. [docs/COOKBOOK.md](docs/COOKBOOK.md): 按任务组织的落地配方
-3. [docs/API_REFERENCE.md](docs/API_REFERENCE.md): 公开类和方法速查
-4. [docs/VALIDATION_CHECKLIST.md](docs/VALIDATION_CHECKLIST.md): 构建、测试、联调和压测步骤
-5. [docs/RELEASE_STATUS.md](docs/RELEASE_STATUS.md): 当前已经完成的验证和保留边界
+---
 
-## 能力概览
+## Performance (loopback, single machine)
 
-- TCP: 服务端、客户端、连接池、close-after-flush、move/shared buffer 路径
-- UDP: 无连接收发、广播、loopback benchmark
-- HTTP: HTTP/1.1 server/client、静态文件、Range、304、HEAD、重定向客户端
-- WebSocket: server/client、文本/二进制消息、ping/pong、close handshake
-- TLS: 通过 `FASTNET_ENABLE_SSL=ON` 条件编译接入 OpenSSL
-- 运行时: `IoService`、`EventPoller`、`TimerManager`
-- 工程能力: CMake 构建、安装导出 `FastNet::FastNet`、Windows/Linux 脚本入口
+> Measured on Windows with Release + MSVC. Results are loopback baselines; cross-machine numbers will differ.
 
-## 构建
+| Protocol | Peak Throughput | Avg Latency |
+|---|---|---|
+| UDP | ~17,112 QTPS | — |
+| TCP | ~10,610 QTPS | ~6.03 ms |
+| WebSocket | ~5,390 QTPS | ~5.93 ms |
+| HTTP/1.1 | ~2,100 QTPS | ~15.34 ms |
+
+---
+
+## Quick Start
+
+### Minimal TCP Echo Server
+
+```cpp
+#include "FastNet/FastNet.h"
+#include <iostream>
+
+int main() {
+    if (FastNet::initialize() != FastNet::ErrorCode::Success)
+        return 1;
+
+    auto& io = FastNet::getGlobalIoService();
+    FastNet::TcpServer server(io);
+
+    server.setOwnedDataReceivedCallback([&server](FastNet::ConnectionId id, FastNet::Buffer&& data) {
+        server.sendToClient(id, std::move(data));   // echo back
+    });
+
+    server.start(9000);
+
+    std::string line;
+    std::getline(std::cin, line);   // press Enter to stop
+
+    server.stop();
+    FastNet::cleanup();
+}
+```
+
+### HTTP Server
+
+```cpp
+FastNet::HttpServer server(FastNet::getGlobalIoService());
+
+server.registerGet("/healthz", [](const FastNet::HttpRequest&, FastNet::HttpResponse& res) {
+    res.statusCode = 200;
+    res.body = "ok";
+});
+
+server.registerStaticFileHandler("/static", ".");
+server.start(8080);
+```
+
+### WebSocket Server
+
+```cpp
+FastNet::WebSocketServer ws(FastNet::getGlobalIoService());
+
+ws.setMessageCallback([&ws](FastNet::ConnectionId id, const std::string& text) {
+    ws.sendTextToClient(id, text);  // echo
+});
+
+ws.setPingInterval(30000);
+ws.start(8081);
+```
+
+### TLS Client
+
+```cpp
+FastNet::SSLConfig ssl;
+ssl.enableSSL         = true;
+ssl.caFile            = "ca.crt";
+ssl.verifyPeer        = true;
+ssl.hostnameVerification = "api.example.com";
+
+FastNet::TcpClient client(FastNet::getGlobalIoService());
+client.connect("api.example.com", 443, [](bool ok, const std::string&) {}, ssl);
+```
+
+---
+
+## Building
+
+### Prerequisites
+
+| Platform | Toolchain |
+|---|---|
+| Windows | Visual Studio 2019/2022 with C++ workload, CMake ≥ 3.15 |
+| Linux | GCC ≥ 9 or Clang ≥ 10, CMake ≥ 3.15, optional Ninja |
+
+Optional: OpenSSL (for TLS support).
 
 ### Windows
 
-需要 Visual Studio 2019/2022 C++ 工具链和 CMake。
-
 ```powershell
-build.bat --clean
-build.bat --ssl --release-only
-build.bat --no-examples --no-tests
+build.bat --clean --release-only
+build.bat --clean --ssl --release-only   # with TLS
 ```
-
-常用参数：
-
-- `--clean`: 删除构建目录后重新配置
-- `--ssl`: 打开 OpenSSL/TLS 支持
-- `--release-only` / `--debug-only`: 只构建单一配置
-- `--no-examples` / `--no-tests`: 跳过示例或测试目标
-- `--build-dir DIR`: 指定构建目录
-- `--generator GEN`: 指定 CMake generator
 
 ### Linux
 
-需要 C++17 编译器、CMake 和可选 Ninja。Ubuntu/Debian 示例：
-
 ```bash
-sudo apt install build-essential cmake ninja-build
-sudo apt install libssl-dev
+sudo apt install build-essential cmake ninja-build libssl-dev
+./build.sh --clean --release-only --test
+./build.sh --clean --ssl --release-only --test   # with TLS
 ```
 
-使用仓库脚本：
+### CMake directly
 
 ```bash
-chmod +x build.sh
-./build.sh --clean --release-only
-./build.sh --ssl --release-only --test
-./build.sh --no-examples --no-tests
-```
+# Linux
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DFASTNET_ENABLE_SSL=OFF
+cmake --build build --parallel
 
-Linux 脚本默认使用 `build/linux/Release` 和 `build/linux/Debug`，避免混用 Windows 的 Visual Studio 构建目录。产物仍输出到项目根目录下的 `bin/` 和 `lib/`。
-
-如果目标环境的 GCC/Clang 对 warning 更严格，可以先用：
-
-```bash
-./build.sh --release-only --no-werror
-```
-
-### 直接使用 CMake
-
-Windows 示例：
-
-```powershell
+# Windows
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DFASTNET_ENABLE_SSL=OFF
 cmake --build build --config Release
 ```
 
-Linux 示例：
+Key CMake options:
 
-```bash
-cmake -S . -B build/linux/Release -G Ninja -DCMAKE_BUILD_TYPE=Release -DFASTNET_ENABLE_SSL=OFF
-cmake --build build/linux/Release --parallel
+| Option | Default | Description |
+|---|---|---|
+| `FASTNET_BUILD_EXAMPLES` | ON | Build example programs |
+| `FASTNET_BUILD_TESTS` | ON | Build regression tests |
+| `FASTNET_ENABLE_SSL` | OFF | Enable OpenSSL/TLS |
+| `FASTNET_WARNINGS_AS_ERRORS` | ON | Treat warnings as errors |
+| `FASTNET_INSTALL_CMAKE_PACKAGE` | ON | Install CMake package files |
+
+### Consuming via CMake `find_package`
+
+```cmake
+find_package(FastNet REQUIRED)
+target_link_libraries(my_app PRIVATE FastNet::FastNet)
 ```
 
-主要 CMake 选项：
+---
 
-- `FASTNET_BUILD_EXAMPLES`: 是否构建 `examples/`
-- `FASTNET_BUILD_TESTS`: 是否构建 `test/`
-- `FASTNET_ENABLE_SSL`: 是否启用 OpenSSL/TLS
-- `FASTNET_WARNINGS_AS_ERRORS`: 是否把 warning 当错误
-- `FASTNET_INSTALL_CMAKE_PACKAGE`: 是否安装 CMake package 文件
-
-## 示例程序
-
-示例目标默认输出到 `bin/`：
-
-- `fastnet_tcp_echo_server`: TCP Echo 服务端
-- `fastnet_tcp_loopback_benchmark`: TCP loopback 吞吐与 RTT 基线
-- `fastnet_tcp_connect_burst_benchmark`: TCP 建连 burst 基线
-- `fastnet_udp_loopback_benchmark`: UDP loopback 吞吐基线
-- `fastnet_http_get_client`: HTTP GET 客户端
-- `fastnet_http_static_server`: HTTP 静态文件、健康检查和 echo API
-- `fastnet_http_loopback_benchmark`: HTTP/HTTPS loopback 基线
-- `fastnet_http_connect_burst_benchmark`: HTTP/HTTPS 建连 burst 基线
-- `fastnet_websocket_echo_server`: WebSocket 文本/二进制 echo 服务端
-- `fastnet_websocket_loopback_benchmark`: WebSocket/WSS loopback 基线
-- `fastnet_websocket_connect_burst_benchmark`: WebSocket/WSS 建连 burst 基线
-- `fastnet_benchmark_matrix_runner`: 串行执行 benchmark 矩阵并输出 Markdown 报告
-
-Windows 执行示例：
-
-```powershell
-bin\fastnet_http_static_server 8080 .
-bin\fastnet_websocket_echo_server 8081
-```
-
-Linux 执行示例：
+## Running Tests
 
 ```bash
+# Linux
+./build.sh --clean --release-only --test
+
+# Windows
+build.bat --clean --release-only
+cd build && ctest -C Release --output-on-failure
+```
+
+---
+
+## Examples
+
+Binaries are output to `bin/`. Start with:
+
+```bash
+./bin/fastnet_tcp_echo_server
 ./bin/fastnet_http_static_server 8080 .
 ./bin/fastnet_websocket_echo_server 8081
+./bin/fastnet_benchmark_matrix_runner   # runs the full benchmark matrix
 ```
 
+Full list of examples in [`examples/`](examples/).
+
+---
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Module selection, lifecycle, minimal usage patterns |
+| [docs/COOKBOOK.md](docs/COOKBOOK.md) | Task-oriented recipes |
+| [docs/API_REFERENCE.md](docs/API_REFERENCE.md) | Public classes and methods |
+| [docs/VALIDATION_CHECKLIST.md](docs/VALIDATION_CHECKLIST.md) | Build, test, and benchmark checklist |
+| [docs/RELEASE_STATUS.md](docs/RELEASE_STATUS.md) | Verified configurations and known boundaries |
+
+---
+
+## Project Structure
+
+```
+include/FastNet/   — Public headers
+src/               — Core implementation
+examples/          — Example programs and benchmarks
+test/              — Regression tests (20 files)
+docs/              — Documentation
+cmake/             — CMake package config template
+```
+
+---
+
+## License
+
+[LGPL-2.1](LICENSE)

@@ -14,12 +14,19 @@ set "CLEAN_FIRST=0"
 set "CLEAN_ONLY=0"
 set "EXTRA_CMAKE_ARGS="
 set "CMAKE_EXE=cmake"
-set "OPENSSL_ROOT_DIR=D:\projectC++\lib\vcpkg-master\packages\openssl_x64-windows"
+rem OPENSSL_ROOT_DIR is intentionally not set here.
+rem Pass -DOPENSSL_ROOT_DIR=<path> as an extra argument when needed:
+rem   build.bat --ssl -DOPENSSL_ROOT_DIR=C:\path\to\openssl
 
 :parse_args
 if "%~1"=="" goto after_parse
 if /I "%~1"=="--help" goto show_help
 if /I "%~1"=="--clean" (
+    set "CLEAN_FIRST=1"
+    shift
+    goto parse_args
+)
+if /I "%~1"=="--clean-only" (
     set "CLEAN_ONLY=1"
     shift
     goto parse_args
@@ -114,7 +121,7 @@ if not exist "%BUILD_DIR%" (
 )
 
 echo [3/5] Configuring CMake...
-"%CMAKE_EXE%" -S "%PROJECT_DIR%" -B "%BUILD_DIR%" -G "%CMAKE_GENERATOR%" -A x64 -DFASTNET_ENABLE_SSL=%FASTNET_ENABLE_SSL% -DFASTNET_BUILD_EXAMPLES=%FASTNET_BUILD_EXAMPLES% -DFASTNET_BUILD_TESTS=%FASTNET_BUILD_TESTS% -DOPENSSL_ROOT_DIR="%OPENSSL_ROOT_DIR%" %EXTRA_CMAKE_ARGS%
+"%CMAKE_EXE%" -S "%PROJECT_DIR%" -B "%BUILD_DIR%" -G "%CMAKE_GENERATOR%" -A x64 -DFASTNET_ENABLE_SSL=%FASTNET_ENABLE_SSL% -DFASTNET_BUILD_EXAMPLES=%FASTNET_BUILD_EXAMPLES% -DFASTNET_BUILD_TESTS=%FASTNET_BUILD_TESTS% %EXTRA_CMAKE_ARGS%
 if errorlevel 1 (
     echo [ERROR] CMake configuration failed.
     exit /b 1
@@ -219,8 +226,9 @@ exit /b 1
 echo Usage: build.bat [options] [extra-cmake-args]
 echo.
 echo Options:
-echo   --clean         Remove the build directory and exit (clean only)
-echo   --rebuild       Remove the build directory and then build
+echo   --clean         Remove the build directory then build (same as --rebuild)
+echo   --clean-only    Remove the build directory and exit without building
+echo   --rebuild       Remove the build directory then build (same as --clean)
 echo   --ssl           Enable FASTNET_ENABLE_SSL
 echo   --no-examples   Disable example targets
 echo   --no-tests      Disable test targets

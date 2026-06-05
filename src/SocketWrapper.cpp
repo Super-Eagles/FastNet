@@ -995,10 +995,11 @@ Error SocketWrapper::shutdownRead() {
     }
 
 #ifdef _WIN32
-    if (::shutdown(fd_, SD_RECEIVE) != 0) {
+    const int how = SD_RECEIVE;
 #else
-    if (::shutdown(fd_, SHUT_RD) != 0) {
+    const int how = SHUT_RD;
 #endif
+    if (::shutdown(fd_, how) != 0) {
         lastError_ = Error(ErrorCode::SocketError, "Failed to shutdown read", getLastSocketError());
         return lastError_;
     }
@@ -1014,10 +1015,11 @@ Error SocketWrapper::shutdownBoth() {
     }
 
 #ifdef _WIN32
-    if (::shutdown(fd_, SD_BOTH) != 0) {
+    const int how = SD_BOTH;
 #else
-    if (::shutdown(fd_, SHUT_RDWR) != 0) {
+    const int how = SHUT_RDWR;
 #endif
+    if (::shutdown(fd_, how) != 0) {
         lastError_ = Error(ErrorCode::SocketError, "Failed to shutdown both", getLastSocketError());
         return lastError_;
     }

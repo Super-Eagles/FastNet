@@ -10,6 +10,8 @@
 !*.hpp
 !*.in
 !*.md
+AGENTS.md
+CLAUDE.md
 !*.txt
 !CMakeLists.txt
 !cmake/
@@ -21,6 +23,7 @@ cmake-build-*/
 out/
 tmp/
 bin/
+lib/
 
 # Visual Studio
 .vs/

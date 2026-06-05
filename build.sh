@@ -12,6 +12,7 @@ BUILD_RELEASE=1
 BUILD_DEBUG=1
 CLEAN_FIRST=0
 RUN_TESTS=0
+CLEAN_ONLY=0
 JOBS="${CMAKE_BUILD_PARALLEL_LEVEL:-}"
 EXTRA_CMAKE_ARGS=()
 
@@ -21,6 +22,7 @@ Usage: ./build.sh [options] [extra-cmake-args]
 
 Options:
   --clean          Remove Linux build directories before configuring
+  --clean-only     Remove Linux build directories and exit without building
   --ssl            Enable FASTNET_ENABLE_SSL
   --no-examples    Disable example targets
   --no-tests       Disable test targets
@@ -110,6 +112,10 @@ while [[ $# -gt 0 ]]; do
             CLEAN_FIRST=1
             shift
             ;;
+        --clean-only)
+            CLEAN_ONLY=1
+            shift
+            ;;
         --ssl)
             FASTNET_ENABLE_SSL="ON"
             shift
@@ -180,6 +186,14 @@ case "${BUILD_ROOT}" in
 esac
 
 require_command cmake
+
+if [[ "${CLEAN_ONLY}" -eq 1 ]]; then
+    echo "[clean] Removing Linux build directories..."
+    remove_build_dir "${BUILD_ROOT}/Release"
+    remove_build_dir "${BUILD_ROOT}/Debug"
+    echo "[clean] Completed."
+    exit 0
+fi
 if [[ "${RUN_TESTS}" -eq 1 && "${FASTNET_BUILD_TESTS}" == "ON" ]]; then
     require_command ctest
 fi

@@ -6,6 +6,7 @@
 #ifdef FASTNET_ENABLE_IOURING
 
 #include "IoUringPoller.h"
+#include "FlatHashMap.h"
 
 #include <cerrno>
 #include <cstring>
@@ -93,20 +94,21 @@ io_uring_sqe* IoUringPoller::getSqe() noexcept {
 }
 
 void IoUringPoller::registerCallback(uintptr_t userData, IoUringCompletionFn cb) {
+    // FlatHashMap gives O(1) amortised insert — no linear scan needed.
+    // Lock is still needed because submit can be called from multiple threads.
     std::lock_guard<std::mutex> lock(cbMutex_);
-    callbacks_.push_back({userData, std::move(cb)});
+    callbacks_.emplace(userData, std::move(cb));
 }
 
 IoUringCompletionFn IoUringPoller::takeCallback(uintptr_t userData) {
     std::lock_guard<std::mutex> lock(cbMutex_);
-    for (auto it = callbacks_.begin(); it != callbacks_.end(); ++it) {
-        if (it->userData == userData) {
-            IoUringCompletionFn cb = std::move(it->callback);
-            callbacks_.erase(it);
-            return cb;
-        }
+    auto it = callbacks_.find(userData);
+    if (it == callbacks_.end()) {
+        return {};
     }
-    return {};
+    IoUringCompletionFn cb = std::move(it->second);
+    callbacks_.erase(it);
+    return cb;
 }
 
 // ── Submission ───────────────────────────────────────────────────────────────

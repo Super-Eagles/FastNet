@@ -75,7 +75,9 @@ void applyRuntimeConfiguration() {
 void shutdownLibraryResources() {
     shutdownGlobalTimerManager();
     shutdownGlobalIoService();
+#ifdef _WIN32
     shutdownWindowsIocpTransport();
+#endif
     getPerformanceMonitor().shutdown();
     AsyncLogger::getInstance().shutdown();
     SocketWrapper::cleanupSocketLibrary();

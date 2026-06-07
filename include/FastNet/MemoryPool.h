@@ -15,6 +15,7 @@
 #pragma once
 
 #include "Config.h"
+#include "SpinLock.h"
 
 #include <atomic>
 #include <cstddef>
@@ -442,12 +443,6 @@ private:
     static constexpr size_t kSmallReserveSize = 8192;
     static constexpr size_t kLargeReserveSize = 65536;
 
-    // Internal node for the lock-free return queue (Treiber stack).
-    struct ReturnNode {
-        Buffer*     buffer = nullptr;
-        ReturnNode* next   = nullptr;
-    };
-
     BufferPool() = default;
     ~BufferPool() {
         // Drain any pending cross-thread returns and delete everything.
@@ -464,37 +459,26 @@ private:
 
     // Called by the deleter — may run on ANY thread.
     void returnBuffer(Buffer* ptr) noexcept {
-        // Allocate a ReturnNode on the heap.  This is a one-time cost per
-        // cross-thread return; nodes themselves are pooled in a side-channel
-        // for zero-alloc steady-state (future optimization).
-        ReturnNode* node = new (std::nothrow) ReturnNode{ptr, nullptr};
-        if (!node) {
-            // Absolute last resort: free directly rather than touching another
-            // thread's TLS cache.
+        try {
+            SpinLockGuard lock(returnQueueLock_);
+            returnedBuffers_.push_back(ptr);
+        } catch (...) {
+            // Absolute last resort fallback: delete if push_back throws std::bad_alloc
             delete ptr;
-            return;
         }
-        // Push onto the Treiber stack.
-        ReturnNode* oldHead = returnQueue_.load(std::memory_order_relaxed);
-        do {
-            node->next = oldHead;
-        } while (!returnQueue_.compare_exchange_weak(
-            oldHead, node,
-            std::memory_order_release,
-            std::memory_order_relaxed));
     }
 
     // Drain the cross-thread return queue into the local TLS cache.
     // Must be called from the allocating thread.
     void drainReturnQueue() noexcept {
-        ReturnNode* list = returnQueue_.exchange(nullptr, std::memory_order_acquire);
-        if (!list) return;
+        std::vector<Buffer*> local;
+        {
+            SpinLockGuard lock(returnQueueLock_);
+            if (returnedBuffers_.empty()) return;
+            local.swap(returnedBuffers_);
+        }
         auto& cache = localCache();
-        while (list) {
-            ReturnNode* next = list->next;
-            Buffer* buf = list->buffer;
-            delete list;
-            list = next;
+        for (Buffer* buf : local) {
             if (!buf) continue;
             if (buf->capacity() <= kSmallReserveSize && cache.smallBuffers.size() < 128) {
                 cache.smallBuffers.push_back(buf);
@@ -520,9 +504,8 @@ private:
         return cache;
     }
 
-    // Lock-free MPSC return queue (Treiber stack).  Writers are any thread;
-    // the sole reader is the allocating thread inside drainReturnQueue().
-    std::atomic<ReturnNode*> returnQueue_{nullptr};
+    mutable SpinLock returnQueueLock_;
+    std::vector<Buffer*> returnedBuffers_;
 };
 
 } // namespace FastNet

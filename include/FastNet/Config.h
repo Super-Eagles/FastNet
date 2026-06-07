@@ -52,7 +52,14 @@
         #pragma warning(disable: 4275) // base class std::runtime_error not exported
     #endif
 #else
-    #define FASTNET_API
+    // On GCC/Clang (Linux/macOS): mark public API symbols as default-visible
+    // so they are accessible from the shared library even when compiled with
+    // -fvisibility=hidden (which hides all other internal symbols).
+    #if defined(__GNUC__) || defined(__clang__)
+        #define FASTNET_API __attribute__((visibility("default")))
+    #else
+        #define FASTNET_API
+    #endif
 #endif
 // 平台检测
 #if defined(__linux__)

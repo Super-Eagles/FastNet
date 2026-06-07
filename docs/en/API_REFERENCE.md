@@ -727,6 +727,8 @@ Core Methods:
 
 Header: [../../include/FastNet/BenchmarkUtils.h](../../include/FastNet/BenchmarkUtils.h)
 
+### `BenchmarkUtils`
+
 Common Methods:
 - `getCurrentTime()`
 - `now()`

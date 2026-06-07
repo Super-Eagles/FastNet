@@ -10,6 +10,9 @@
 !*.hpp
 !*.in
 !*.md
+!vcpkg.json
+!.github/
+!.github/**
 AGENTS.md
 CLAUDE.md
 !*.txt

@@ -68,63 +68,7 @@ constexpr size_t kDirectFileSendChunkSize = 1024 * 1024;
 // Chosen to fit in a stack array; virtually no real message will exceed this.
 constexpr size_t kMaxScatterGatherIov = 64;
 
-#ifndef _WIN32
-/**
- * Attempt a single writev() across up to kMaxScatterGatherIov pending
- * Buffer-type PendingSend entries in the queue.
- *
- * Returns the total bytes written, 0 if EAGAIN, -1 on hard error.
- * Updates bufferOffset in each affected PendingSend on success.
- *
- * This collapses N send() syscalls into 1, which is critical for
- * high-frequency small-message workloads (HTTP/1.1, WebSocket frames, etc.)
- */
-inline ssize_t gatherAndWriteBuffers(int fd,
-                                      std::deque<PendingSend>& queue) noexcept {
-    // Build iov array from consecutive Buffer-type head entries.
-    iovec iov[kMaxScatterGatherIov];
-    size_t iovCount = 0;
-    size_t totalBytes = 0;
 
-    for (auto& item : queue) {
-        if (item.kind != PendingSendKind::Buffer) break;  // stop at file send
-        if (iovCount >= kMaxScatterGatherIov)             break;
-
-        const size_t payloadSize  = item.bufferedPayloadSize();
-        const uint8_t* payloadPtr = item.bufferedPayloadBytes();
-        if (payloadPtr == nullptr || item.bufferOffset >= payloadSize) break;
-
-        iov[iovCount].iov_base = const_cast<uint8_t*>(payloadPtr + item.bufferOffset);
-        iov[iovCount].iov_len  = payloadSize - item.bufferOffset;
-        totalBytes            += iov[iovCount].iov_len;
-        ++iovCount;
-    }
-
-    if (iovCount == 0) return 0;
-
-    const ssize_t written = ::writev(fd, iov, static_cast<int>(iovCount));
-    if (written <= 0) { return written; }
-
-    // Commit: advance bufferOffset in each affected PendingSend.
-    ssize_t remaining = written;
-    for (auto& item : queue) {
-        if (remaining <= 0)                          break;
-        if (item.kind != PendingSendKind::Buffer)    break;
-
-        const size_t available =
-            item.bufferedPayloadSize() - item.bufferOffset;
-        if (static_cast<size_t>(remaining) >= available) {
-            item.bufferOffset += available;
-            remaining         -= static_cast<ssize_t>(available);
-        } else {
-            item.bufferOffset += static_cast<size_t>(remaining);
-            remaining = 0;
-        }
-    }
-
-    return written;
-}
-#endif // !_WIN32
 
 #ifdef _WIN32
 constexpr DWORD kAcceptExAddressLength = static_cast<DWORD>(sizeof(sockaddr_storage) + 16);
@@ -616,6 +560,64 @@ private:
     }
 };
 
+#ifndef _WIN32
+/**
+ * Attempt a single writev() across up to kMaxScatterGatherIov pending
+ * Buffer-type PendingSend entries in the queue.
+ *
+ * Returns the total bytes written, 0 if EAGAIN, -1 on hard error.
+ * Updates bufferOffset in each affected PendingSend on success.
+ *
+ * This collapses N send() syscalls into 1, which is critical for
+ * high-frequency small-message workloads (HTTP/1.1, WebSocket frames, etc.)
+ */
+inline ssize_t gatherAndWriteBuffers(int fd,
+                                      std::deque<PendingSend>& queue) noexcept {
+    // Build iov array from consecutive Buffer-type head entries.
+    iovec iov[kMaxScatterGatherIov];
+    size_t iovCount = 0;
+    size_t totalBytes = 0;
+
+    for (auto& item : queue) {
+        if (item.kind != PendingSendKind::Buffer) break;  // stop at file send
+        if (iovCount >= kMaxScatterGatherIov)             break;
+
+        const size_t payloadSize  = item.bufferedPayloadSize();
+        const uint8_t* payloadPtr = item.bufferedPayloadBytes();
+        if (payloadPtr == nullptr || item.bufferOffset >= payloadSize) break;
+
+        iov[iovCount].iov_base = const_cast<uint8_t*>(payloadPtr + item.bufferOffset);
+        iov[iovCount].iov_len  = payloadSize - item.bufferOffset;
+        totalBytes            += iov[iovCount].iov_len;
+        ++iovCount;
+    }
+
+    if (iovCount == 0) return 0;
+
+    const ssize_t written = ::writev(fd, iov, static_cast<int>(iovCount));
+    if (written <= 0) { return written; }
+
+    // Commit: advance bufferOffset in each affected PendingSend.
+    ssize_t remaining = written;
+    for (auto& item : queue) {
+        if (remaining <= 0)                          break;
+        if (item.kind != PendingSendKind::Buffer)    break;
+
+        const size_t available =
+            item.bufferedPayloadSize() - item.bufferOffset;
+        if (static_cast<size_t>(remaining) >= available) {
+            item.bufferOffset += available;
+            remaining         -= static_cast<ssize_t>(available);
+        } else {
+            item.bufferOffset += static_cast<size_t>(remaining);
+            remaining = 0;
+        }
+    }
+
+    return written;
+}
+#endif // !_WIN32
+
 enum class FlushOutcome {
     QueueDrained,
     WouldBlock,
@@ -682,6 +684,19 @@ public:
             socket_.close();
             return false;
         }
+
+        // 256 KiB buffers: kernel can batch more data per syscall, reducing
+        // context-switch frequency and increasing throughput under load.
+        result = socket_.setSendBufferSize(256 * 1024);
+        if (result.isFailure()) {
+            // Non-fatal: log and continue with the kernel default buffer size.
+            lastFailureMessage_.clear();
+        }
+        result = socket_.setRecvBufferSize(256 * 1024);
+        if (result.isFailure()) {
+            lastFailureMessage_.clear();
+        }
+
         socket_.optimizeLoopbackFastPath();
 
 #ifdef __linux__
@@ -2090,6 +2105,18 @@ private:
         }
         handleTransportFailure(ErrorCode::SocketError, SocketWrapper::getErrorMessage(systemError));
     }
+#endif
+
+#ifndef _WIN32
+#ifdef FASTNET_ENABLE_SSL
+    bool usingWindowsIocpTls() const {
+        return false;
+    }
+
+    bool hasPendingWindowsIocpTlsOutputLocked() const {
+        return false;
+    }
+#endif
 #endif
 
     void armConnectionTimer() {

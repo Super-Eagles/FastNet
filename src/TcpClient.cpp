@@ -82,6 +82,11 @@ public:
         SocketOption option;
         option.noDelay = true;
         option.keepAlive = true;
+        // 256 KiB send/recv buffers: allows the kernel to batch more data per
+        // syscall, significantly boosting throughput at the cost of ~512 KiB of
+        // kernel memory per connection — an acceptable trade-off for networking.
+        option.sendBufferSize = 256 * 1024;
+        option.recvBufferSize = 256 * 1024;
         result = socket_.setOption(option);
         if (result.isFailure()) {
             socket_.close();
@@ -1579,6 +1584,18 @@ private:
         }
         handleTransportFailure(ErrorCode::SocketError, SocketWrapper::getErrorMessage(systemError));
     }
+#endif
+
+#ifndef _WIN32
+#ifdef FASTNET_ENABLE_SSL
+    bool usingWindowsIocpTls() const {
+        return false;
+    }
+
+    bool hasPendingWindowsIocpTlsOutputLocked() const {
+        return false;
+    }
+#endif
 #endif
 
     void armConnectTimer() {

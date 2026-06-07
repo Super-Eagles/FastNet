@@ -40,6 +40,10 @@ struct IoResult {
     WaitDirection wait = WaitDirection::None;
     ErrorCode errorCode = ErrorCode::Success;
     std::string message;
+
+    IoResult() = default;
+    IoResult(IoStatus s, size_t b = 0, WaitDirection w = WaitDirection::None, ErrorCode ec = ErrorCode::Success, std::string msg = "")
+        : status(s), bytes(b), wait(w), errorCode(ec), message(std::move(msg)) {}
 };
 
 struct QueuedWrite {

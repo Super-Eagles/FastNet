@@ -19,6 +19,7 @@
 
 #include "Config.h"
 #include "Error.h"
+#include "FlatHashMap.h"
 #include "SocketWrapper.h"
 
 #include <atomic>
@@ -175,14 +176,10 @@ private:
 
     std::atomic<size_t> inflight_{0};
 
-    // Callback registry keyed by user_data.
-    // In production code, replace with FlatHashMap<uintptr_t, ...>.
-    struct CbEntry {
-        uintptr_t           userData;
-        IoUringCompletionFn callback;
-    };
-    std::vector<CbEntry> callbacks_;  // small vector; replace with flat_hash_map
-    std::mutex           cbMutex_;
+    // O(1) callback registry keyed by user_data — FlatHashMap for cache-friendly
+    // open-addressing with minimal allocations on the hot CQE dispatch path.
+    FlatHashMap<uintptr_t, IoUringCompletionFn> callbacks_;
+    std::mutex                                   cbMutex_;
 
     // Pending accept sockaddr (kept alive for the duration of the SQE).
     struct AcceptState {

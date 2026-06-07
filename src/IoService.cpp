@@ -16,14 +16,23 @@
 #include <vector>
 #include <utility>
 
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 namespace FastNet {
 
 namespace {
 
 constexpr size_t kMaxThreadPoolSize  = 1024;
 constexpr size_t kMaxPollEvents      = 10000;
-constexpr int    kPollTimeoutMs      = 10;   // ms; poller thread epoll_wait timeout
-constexpr size_t kMailboxDrainBudget = 256;  // max tasks to drain from mailbox per loop
+// Zero timeout: epoll_wait returns immediately if no events are ready,
+// letting the poller loop spin and process mailbox tasks without sleeping.
+// This halves latency at the cost of slightly higher idle CPU on the poller
+// thread — acceptable for a dedicated high-throughput networking service.
+constexpr int    kPollTimeoutMs      = 0;
+constexpr size_t kMailboxDrainBudget = 512;  // drain more tasks per loop
 
 std::mutex                   g_globalIoServiceMutex;
 std::unique_ptr<IoService>   g_globalIoService;
@@ -149,6 +158,24 @@ struct IoService::Impl {
     }
 
     void pollerLoop() {
+        // ── CPU affinity: pin this thread to the last available core ──────────
+        // Keeping the poller thread on a dedicated core avoids cache-line
+        // invalidations caused by OS migration between cores, and ensures
+        // epoll_wait / io_uring completions are always dispatched from a warm L1.
+#ifdef __linux__
+        {
+            const int nproc = static_cast<int>(std::thread::hardware_concurrency());
+            if (nproc > 1) {
+                cpu_set_t cpuset;
+                CPU_ZERO(&cpuset);
+                // Use the last core (nproc-1) for the poller to avoid fighting
+                // worker threads that typically occupy core 0 first.
+                CPU_SET(nproc - 1, &cpuset);
+                pthread_setaffinity_np(pthread_self(),
+                                       sizeof(cpu_set_t), &cpuset);
+            }
+        }
+#endif
         try {
             while (running.load(std::memory_order_acquire)) {
                 drainMailbox();

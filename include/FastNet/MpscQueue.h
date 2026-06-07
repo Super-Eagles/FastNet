@@ -16,10 +16,12 @@
  */
 #pragma once
 
+#include "SpinLock.h"
 #include <atomic>
 #include <cstddef>
 #include <new>
 #include <utility>
+#include <vector>
 
 namespace FastNet {
 
@@ -35,14 +37,14 @@ public:
     }
 
     ~MpscQueue() noexcept {
-        // Drain all remaining nodes directly — no need to construct a temporary T.
-        // Node default destructor calls ~T() for each live value automatically.
-        // This also removes the implicit requirement that T is DefaultConstructible.
         Node* curr = tail_;
         while (curr != nullptr) {
             Node* next = curr->next.load(std::memory_order_acquire);
             delete curr;
             curr = next;
+        }
+        for (Node* node : freeList_) {
+            delete node;
         }
     }
 
@@ -58,7 +60,7 @@ public:
      * Safe to call concurrently from any number of threads.
      */
     void push(T value) {
-        Node* node = new Node{std::move(value)};
+        Node* node = acquireNode(std::move(value));
         // Exchange head: we atomically claim "the slot after prev".
         Node* prev = head_.exchange(node, std::memory_order_acq_rel);
         // Link prev -> node so the consumer can walk to it.
@@ -81,7 +83,7 @@ public:
         }
         out   = std::move(next->value);
         tail_ = next;
-        delete tail;  // old stub owned exclusively by the consumer
+        recycleNode(tail);  // old stub owned exclusively by the consumer
         return true;
     }
 
@@ -104,7 +106,7 @@ public:
             container.push_back(std::move(next->value));
             Node* old = tail;
             tail      = next;
-            delete old;
+            recycleNode(old);
             ++n;
         }
         tail_ = tail;
@@ -129,7 +131,7 @@ public:
             container.push_back(std::move(next->value));
             Node* old = tail;
             tail      = next;
-            delete old;
+            recycleNode(old);
             ++n;
         }
         tail_ = tail;
@@ -163,11 +165,34 @@ private:
         explicit Node(T v) : value(std::move(v)) {}
     };
 
+    Node* acquireNode(T value) {
+        {
+            SpinLockGuard lock(freeListLock_);
+            if (!freeList_.empty()) {
+                Node* node = freeList_.back();
+                freeList_.pop_back();
+                node->value = std::move(value);
+                node->next.store(nullptr, std::memory_order_relaxed);
+                return node;
+            }
+        }
+        return new Node(std::move(value));
+    }
+
+    void recycleNode(Node* node) {
+        node->value = T{};
+        SpinLockGuard lock(freeListLock_);
+        freeList_.push_back(node);
+    }
+
     // head_ is written by every producer (one exchange per push).
     alignas(64) std::atomic<Node*> head_;
 
     // tail_ is read/written exclusively by the single consumer.
     alignas(64) Node* tail_;
+
+    SpinLock freeListLock_;
+    std::vector<Node*> freeList_;
 };
 
 } // namespace FastNet

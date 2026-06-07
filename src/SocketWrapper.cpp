@@ -25,6 +25,7 @@
 #include <netdb.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
+#include <poll.h>
 #endif
 
 namespace FastNet {
@@ -472,6 +473,23 @@ Error SocketWrapper::connect(const Address& address, int timeoutMs) {
         return lastError_;
     }
 
+#ifndef _WIN32
+    struct pollfd pfd;
+    pfd.fd = fd_;
+    pfd.events = POLLOUT | POLLERR | POLLHUP;
+    pfd.revents = 0;
+
+    const int waitResult = ::poll(&pfd, 1, timeoutMs);
+    if (waitResult <= 0) {
+        if (restoreBlocking) {
+            setNonBlocking(false);
+        }
+        lastError_ = waitResult == 0
+                         ? Error(ErrorCode::TimeoutError, "Connection timed out")
+                         : Error(ErrorCode::ConnectionError, "Failed while waiting for connection", getLastSocketError());
+        return lastError_;
+    }
+#else
     fd_set writeSet;
     fd_set errorSet;
     FD_ZERO(&writeSet);
@@ -494,6 +512,7 @@ Error SocketWrapper::connect(const Address& address, int timeoutMs) {
                          : Error(ErrorCode::ConnectionError, "Failed while waiting for connection", getLastSocketError());
         return lastError_;
     }
+#endif
 
     int socketError = 0;
     socket_len_t optionLength = static_cast<socket_len_t>(sizeof(socketError));

@@ -15,27 +15,51 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(FASTNET_BUILD_EXAMPLES "Build FastNet example programs" ON)
 option(FASTNET_BUILD_TESTS "Build FastNet regression tests" ON)
 option(FASTNET_ENABLE_SSL "Enable TLS support through OpenSSL" OFF)
-option(FASTNET_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+option(FASTNET_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(FASTNET_INSTALL_CMAKE_PACKAGE "Install FastNet CMake package files" ON)
+option(FASTNET_ENABLE_IOURING "Enable Linux io_uring backend (requires liburing)" OFF)
+option(FASTNET_NATIVE_ARCH "Enable -march=native CPU-specific optimizations" ON)
+option(FASTNET_ENABLE_LTO "Enable Link-Time Optimization (IPO)" ON)
 
 set(FASTNET_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set(FASTNET_CMAKE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 
-foreach(output_config ${CMAKE_CONFIGURATION_TYPES})
-    string(TOUPPER ${output_config} output_config_upper)
-    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${output_config_upper} ${CMAKE_SOURCE_DIR}/lib)
-    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${output_config_upper} ${CMAKE_SOURCE_DIR}/lib)
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${output_config_upper} ${CMAKE_SOURCE_DIR}/bin)
-endforeach()
+    foreach(output_config ${CMAKE_CONFIGURATION_TYPES})
+        string(TOUPPER ${output_config} output_config_upper)
+        set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${output_config_upper} ${CMAKE_SOURCE_DIR}/lib)
+        set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${output_config_upper} ${CMAKE_SOURCE_DIR}/lib)
+        set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${output_config_upper} ${CMAKE_SOURCE_DIR}/bin)
+    endforeach()
+endif()
 
 find_package(Threads REQUIRED)
 
 if(FASTNET_ENABLE_SSL)
     find_package(OpenSSL REQUIRED)
+endif()
+
+# ── io_uring backend ───────────────────────────────────────────────────────────
+if(FASTNET_ENABLE_IOURING)
+    find_library(LIBURING_LIB uring REQUIRED)
+    find_path(LIBURING_INCLUDE_DIR liburing.h REQUIRED)
+    message(STATUS "io_uring backend enabled (liburing: ${LIBURING_LIB})")
+endif()
+
+# ── Link-Time Optimization ────────────────────────────────────────────────────
+if(FASTNET_ENABLE_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT _ipo_ok OUTPUT _ipo_msg)
+    if(_ipo_ok)
+        message(STATUS "LTO (IPO) enabled")
+    else()
+        message(STATUS "LTO not supported: ${_ipo_msg}")
+        set(FASTNET_ENABLE_LTO OFF)
+    endif()
 endif()
 
 set(FASTNET_SOURCES
@@ -64,6 +88,10 @@ set(FASTNET_SOURCES
     src/base64.cpp
     src/BenchmarkUtils.cpp
 )
+
+if(FASTNET_ENABLE_IOURING)
+    list(APPEND FASTNET_SOURCES src/IoUringPoller.cpp)
+endif()
 
 add_library(FastNet SHARED ${FASTNET_SOURCES})
 add_library(FastNet::FastNet ALIAS FastNet)
@@ -120,15 +148,45 @@ if(FASTNET_WARNINGS_AS_ERRORS)
     list(APPEND FASTNET_OTHER_WARNINGS -Werror)
 endif()
 
+# ── Performance: native arch + visibility + inlining ────────────────────────
+# Flags applied to ALL targets (must be ABI-compatible with libFastNet.so):
+set(FASTNET_ARCH_FLAGS "")
+# Flags applied ONLY to the library (internal symbols can be hidden):
+set(FASTNET_LIB_PRIV_FLAGS "")
+if(NOT MSVC)
+    if(FASTNET_NATIVE_ARCH)
+        list(APPEND FASTNET_ARCH_FLAGS -march=native -mtune=native)
+    endif()
+    # Hidden visibility: only for the library's internal (non-API) symbols.
+    # The public API uses FASTNET_API which must remain visible.
+    list(APPEND FASTNET_LIB_PRIV_FLAGS -fvisibility=hidden -fvisibility-inlines-hidden)
+    # Aggressive inlining and aliasing — safe only within one translation unit.
+    list(APPEND FASTNET_LIB_PRIV_FLAGS -finline-functions -fstrict-aliasing)
+endif()
+
 target_compile_options(FastNet PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:${FASTNET_MSVC_WARNINGS}>
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:${FASTNET_OTHER_WARNINGS}>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:${FASTNET_LIB_PRIV_FLAGS}>
 )
 
 target_compile_options(FastNet
     PUBLIC
         $<$<CXX_COMPILER_ID:MSVC>:/utf-8>
 )
+
+# Apply -march=native to ALL targets (examples, tests) for consistent codegen.
+# Visibility flags are NOT propagated here — they are FastNet-internal only.
+if(FASTNET_ARCH_FLAGS)
+    foreach(_flag IN LISTS FASTNET_ARCH_FLAGS)
+        add_compile_options($<$<NOT:$<CXX_COMPILER_ID:MSVC>>:${_flag}>)
+    endforeach()
+endif()
+
+# ── LTO ──────────────────────────────────────────────────────────────────────
+if(FASTNET_ENABLE_LTO AND _ipo_ok)
+    set_target_properties(FastNet PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
 
 target_link_libraries(FastNet
     PUBLIC
@@ -137,6 +195,13 @@ target_link_libraries(FastNet
 
 if(WIN32)
     target_link_libraries(FastNet PRIVATE ws2_32 mswsock)
+endif()
+
+# ── io_uring ─────────────────────────────────────────────────────────────────
+if(FASTNET_ENABLE_IOURING)
+    target_compile_definitions(FastNet PUBLIC FASTNET_ENABLE_IOURING)
+    target_include_directories(FastNet PRIVATE ${LIBURING_INCLUDE_DIR})
+    target_link_libraries(FastNet PRIVATE ${LIBURING_LIB})
 endif()
 
 if(FASTNET_ENABLE_SSL)

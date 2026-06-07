@@ -17,8 +17,10 @@ namespace FastNet {
 
 class Configuration;
 
+#ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable: 4251)
+#endif
 
 struct ConnectionInfo {
     ConnectionId id = 0;
@@ -85,7 +87,9 @@ struct ServicePoolStats {
     CircuitBreakerStats circuitBreaker;
 };
 
+#ifdef _MSC_VER
 #pragma warning(pop)
+#endif
 
 class FASTNET_API ConnectionManager {
 public:

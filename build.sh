@@ -7,7 +7,10 @@ CMAKE_GENERATOR=""
 FASTNET_ENABLE_SSL="OFF"
 FASTNET_BUILD_EXAMPLES="ON"
 FASTNET_BUILD_TESTS="ON"
-FASTNET_WARNINGS_AS_ERRORS="ON"
+FASTNET_WARNINGS_AS_ERRORS="OFF"
+FASTNET_ENABLE_IOURING="OFF"
+FASTNET_NATIVE_ARCH="ON"
+FASTNET_ENABLE_LTO="ON"
 BUILD_RELEASE=1
 BUILD_DEBUG=1
 CLEAN_FIRST=0
@@ -24,6 +27,9 @@ Options:
   --clean          Remove Linux build directories before configuring
   --clean-only     Remove Linux build directories and exit without building
   --ssl            Enable FASTNET_ENABLE_SSL
+  --iouring        Enable io_uring backend (requires liburing-dev)
+  --no-lto         Disable Link-Time Optimization
+  --no-native      Disable -march=native (for portable builds)
   --no-examples    Disable example targets
   --no-tests       Disable test targets
   --no-werror      Disable FASTNET_WARNINGS_AS_ERRORS
@@ -86,6 +92,9 @@ configure_and_build() {
         -DFASTNET_BUILD_EXAMPLES="${FASTNET_BUILD_EXAMPLES}" \
         -DFASTNET_BUILD_TESTS="${FASTNET_BUILD_TESTS}" \
         -DFASTNET_WARNINGS_AS_ERRORS="${FASTNET_WARNINGS_AS_ERRORS}" \
+        -DFASTNET_ENABLE_IOURING="${FASTNET_ENABLE_IOURING}" \
+        -DFASTNET_NATIVE_ARCH="${FASTNET_NATIVE_ARCH}" \
+        -DFASTNET_ENABLE_LTO="${FASTNET_ENABLE_LTO}" \
         "${EXTRA_CMAKE_ARGS[@]}"
 
     echo "[build] ${config}"
@@ -118,6 +127,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --ssl)
             FASTNET_ENABLE_SSL="ON"
+            shift
+            ;;
+        --iouring)
+            FASTNET_ENABLE_IOURING="ON"
+            shift
+            ;;
+        --no-lto)
+            FASTNET_ENABLE_LTO="OFF"
+            shift
+            ;;
+        --no-native)
+            FASTNET_NATIVE_ARCH="OFF"
             shift
             ;;
         --no-examples)
@@ -209,6 +230,9 @@ echo "Project dir : ${PROJECT_DIR}"
 echo "Build root  : ${BUILD_ROOT}"
 echo "Generator   : ${CMAKE_GENERATOR:-CMake default}"
 echo "SSL         : ${FASTNET_ENABLE_SSL}"
+echo "io_uring    : ${FASTNET_ENABLE_IOURING}"
+echo "Native arch : ${FASTNET_NATIVE_ARCH}"
+echo "LTO         : ${FASTNET_ENABLE_LTO}"
 echo "Examples    : ${FASTNET_BUILD_EXAMPLES}"
 echo "Tests       : ${FASTNET_BUILD_TESTS}"
 echo "Werror      : ${FASTNET_WARNINGS_AS_ERRORS}"

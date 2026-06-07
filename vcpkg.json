@@ -1,0 +1,17 @@
+{
+  "name": "fastnet",
+  "version": "1.4.0",
+  "description": "A production-grade, cross-platform C++17 networking library covering TCP, UDP, HTTP/1.1, WebSocket, TLS, and performance monitoring.",
+  "homepage": "https://github.com/Super-Eagles/FastNet",
+  "license": "LGPL-2.1-only",
+  "supports": "!(uwp)",
+  "dependencies": [],
+  "features": {
+    "ssl": {
+      "description": "Enable TLS support through OpenSSL",
+      "dependencies": [
+        "openssl"
+      ]
+    }
+  }
+}

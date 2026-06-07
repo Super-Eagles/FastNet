@@ -24,11 +24,6 @@ namespace FastNet {
 
 namespace {
 
-bool containsHeaderCaseInsensitive(const RequestHeaders& headers, std::string_view name) {
-    return std::any_of(headers.begin(), headers.end(), [name](const auto& entry) {
-        return HttpParser::caseInsensitiveCompare(entry.first, name);
-    });
-}
 
 bool containsHeaderTokenCaseInsensitive(std::string_view headerValue, std::string_view token) {
     size_t offset = 0;

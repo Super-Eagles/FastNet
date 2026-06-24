@@ -35,7 +35,7 @@ public:
     AsyncLogger(const AsyncLogger&) = delete;
     AsyncLogger& operator=(const AsyncLogger&) = delete;
 
-    void initialize(const std::string& filePath = "fastnet.log",
+    void initialize(const std::string& filePath = "log/fastnet.log",
                     LogLevel level = LogLevel::INFO,
                     size_t maxFileSize = 100 * 1024 * 1024,
                     bool mirrorToConsole = false);

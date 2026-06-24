@@ -128,10 +128,78 @@ public:
         rehash(nextPow2(std::max<size_t>(initialCapacity, 4)));
     }
 
-    FlatHashMap(const FlatHashMap&)            = default;
-    FlatHashMap& operator=(const FlatHashMap&) = default;
-    FlatHashMap(FlatHashMap&&) noexcept        = default;
-    FlatHashMap& operator=(FlatHashMap&&) noexcept = default;
+    ~FlatHashMap() {
+        clear();
+    }
+
+    FlatHashMap(const FlatHashMap& other)
+        : hash_(other.hash_), eq_(other.eq_)
+    {
+        if (other.capacity_ > 0) {
+            rehash(other.capacity_);
+            for (size_t i = 0; i < other.capacity_; ++i) {
+                if (other.psl_[i] != detail::kEmpty) {
+                    insertUnchecked(other.kv_[i].key(), other.kv_[i].value());
+                }
+            }
+        }
+    }
+
+    FlatHashMap& operator=(const FlatHashMap& other) {
+        if (this != &other) {
+            clear();
+            hash_ = other.hash_;
+            eq_ = other.eq_;
+            if (other.capacity_ > 0) {
+                if (capacity_ != other.capacity_) {
+                    rehash(other.capacity_);
+                }
+                for (size_t i = 0; i < other.capacity_; ++i) {
+                    if (other.psl_[i] != detail::kEmpty) {
+                        insertUnchecked(other.kv_[i].key(), other.kv_[i].value());
+                    }
+                }
+            } else {
+                kv_.clear();
+                psl_.clear();
+                capacity_ = 0;
+                mask_ = 0;
+                size_ = 0;
+            }
+        }
+        return *this;
+    }
+
+    FlatHashMap(FlatHashMap&& other) noexcept
+        : kv_(std::move(other.kv_)),
+          psl_(std::move(other.psl_)),
+          capacity_(other.capacity_),
+          mask_(other.mask_),
+          size_(other.size_),
+          hash_(std::move(other.hash_)),
+          eq_(std::move(other.eq_))
+    {
+        other.capacity_ = 0;
+        other.mask_ = 0;
+        other.size_ = 0;
+    }
+
+    FlatHashMap& operator=(FlatHashMap&& other) noexcept {
+        if (this != &other) {
+            clear();
+            kv_ = std::move(other.kv_);
+            psl_ = std::move(other.psl_);
+            capacity_ = other.capacity_;
+            mask_ = other.mask_;
+            size_ = other.size_;
+            hash_ = std::move(other.hash_);
+            eq_ = std::move(other.eq_);
+            other.capacity_ = 0;
+            other.mask_ = 0;
+            other.size_ = 0;
+        }
+        return *this;
+    }
 
     // ── Capacity ──────────────────────────────────────────────────────────
 

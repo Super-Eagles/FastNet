@@ -306,7 +306,7 @@ socket.sendTo(FastNet::Address("127.0.0.1", 9001), "ping");
   - `TcpConnectionPool`: Manages connection reuse inside the selected backend.
   - Do not treat `ConnectionManager` as an actual socket pool, and do not make `TcpConnectionPool` manage multi-backend routing policies.
 
-## 7. Timeout Recommendations
+## 7. Timeout & Polling Recommendations
 
 - `connect timeout`: `3s ~ 10s`.
 - `read timeout`: `0` for persistent connections (managed by protocol heartbeats).
@@ -316,14 +316,32 @@ socket.sendTo(FastNet::Address("127.0.0.1", 9001), "ping");
 
 In connection burst scenarios, WebSocket/WSS handshake processes are longer; set timeouts wider than TCP/HTTP.
 
-## 8. Known Boundaries
+**Adaptive Busy-Spin Polling**:
+*   To achieve both ultra-low latency and low system resource consumption, `IoService` implements an adaptive busy-spin polling strategy. When active (tasks or network events are present), the poller thread spins with `timeout = 0` for up to 10,000 iterations to achieve sub-microsecond event dispatch latency. When the system is completely idle, the poller thread automatically drops to a blocking poll (`timeout = -1`), **reducing idle CPU usage to 0%**.
+
+## 8. Static Library Build & Integration
+
+FastNet is built as a shared library by default, but it can be configured as a static library:
+
+1.  **Build as Static**: Pass `FASTNET_BUILD_STATIC=ON` to CMake during configuration:
+    ```bash
+    # Configure CMake for Static build
+    cmake -S . -B build -G "Visual Studio 16 2019" -A x64 -DFASTNET_BUILD_STATIC=ON
+    # Build Release binaries
+    cmake --build build --config Release
+    ```
+2.  **Linking in Applications**:
+    *   **With CMake**: If you consume FastNet via `find_package(FastNet REQUIRED)` and link using `target_link_libraries(your_app FastNet::FastNet)`, the required `FASTNET_STATIC_LIB` definition will be automatically propagated.
+    *   **Without CMake**: If you link against `FastNet.lib` manually, you must define the `-DFASTNET_STATIC_LIB` compile preprocessor definition in your project settings so that compiler exports are handled correctly.
+
+## 9. Known Boundaries
 
 - `HttpClient` is an HTTP/1.1 keep-alive client, not an HTTP/2 multiplexed client.
 - `HttpServer` and `WebSocketServer` are distinct objects; same-port HTTP upgrade routing is not assumed by default.
 - `TLS + target-qps` loopback benchmark is excluded from the default matrix.
 - Local loopback benchmarks do not replace real multi-machine physical NIC load testing.
 
-## 9. Recommended Reading Order
+## 10. Recommended Reading Order
 
 1. [../../README.md](../../README.md)
 2. [COOKBOOK.md](COOKBOOK.md)

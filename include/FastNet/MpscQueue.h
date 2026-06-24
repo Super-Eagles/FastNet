@@ -43,9 +43,6 @@ public:
             delete curr;
             curr = next;
         }
-        for (Node* node : freeList_) {
-            delete node;
-        }
     }
 
     MpscQueue(const MpscQueue&)             = delete;
@@ -166,23 +163,11 @@ private:
     };
 
     Node* acquireNode(T value) {
-        {
-            SpinLockGuard lock(freeListLock_);
-            if (!freeList_.empty()) {
-                Node* node = freeList_.back();
-                freeList_.pop_back();
-                node->value = std::move(value);
-                node->next.store(nullptr, std::memory_order_relaxed);
-                return node;
-            }
-        }
         return new Node(std::move(value));
     }
 
     void recycleNode(Node* node) {
-        node->value = T{};
-        SpinLockGuard lock(freeListLock_);
-        freeList_.push_back(node);
+        delete node;
     }
 
     // head_ is written by every producer (one exchange per push).
@@ -190,9 +175,6 @@ private:
 
     // tail_ is read/written exclusively by the single consumer.
     alignas(64) Node* tail_;
-
-    SpinLock freeListLock_;
-    std::vector<Node*> freeList_;
 };
 
 } // namespace FastNet

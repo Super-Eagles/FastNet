@@ -163,12 +163,23 @@ public:
     size_t inflight() const noexcept { return inflight_.load(std::memory_order_relaxed); }
 
 private:
+    // Pending accept sockaddr (kept alive for the duration of the SQE).
+    struct AcceptState {
+        sockaddr_storage addr{};
+        socklen_t        addrLen = sizeof(sockaddr_storage);
+    };
+
+    struct CallbackEntry {
+        IoUringCompletionFn callback;
+        std::unique_ptr<AcceptState> acceptState;
+    };
+
     // Internal SQE acquisition with automatic flush on ring full.
     io_uring_sqe* getSqe() noexcept;
 
     // Store the completion callback alongside the SQE's user_data.
-    void registerCallback(uintptr_t userData, IoUringCompletionFn cb);
-    IoUringCompletionFn takeCallback(uintptr_t userData);
+    void registerCallback(uintptr_t userData, IoUringCompletionFn cb, std::unique_ptr<AcceptState> state = nullptr);
+    CallbackEntry takeCallback(uintptr_t userData);
 
     io_uring ring_{};
     bool     initialized_ = false;
@@ -178,15 +189,8 @@ private:
 
     // O(1) callback registry keyed by user_data — FlatHashMap for cache-friendly
     // open-addressing with minimal allocations on the hot CQE dispatch path.
-    FlatHashMap<uintptr_t, IoUringCompletionFn> callbacks_;
-    std::mutex                                   cbMutex_;
-
-    // Pending accept sockaddr (kept alive for the duration of the SQE).
-    struct AcceptState {
-        sockaddr_storage addr{};
-        socklen_t        addrLen = sizeof(sockaddr_storage);
-    };
-    std::vector<std::unique_ptr<AcceptState>> acceptStates_;
+    FlatHashMap<uintptr_t, CallbackEntry> callbacks_;
+    std::mutex                            cbMutex_;
 };
 
 /**

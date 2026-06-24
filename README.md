@@ -155,6 +155,7 @@ Key CMake options:
 | `FASTNET_ENABLE_SSL` | OFF | Enable OpenSSL/TLS |
 | `FASTNET_WARNINGS_AS_ERRORS` | ON | Treat warnings as errors |
 | `FASTNET_INSTALL_CMAKE_PACKAGE` | ON | Install CMake package files |
+| `FASTNET_BUILD_STATIC` | OFF | Build FastNet as a static library |
 
 ### Consuming via CMake `find_package`
 

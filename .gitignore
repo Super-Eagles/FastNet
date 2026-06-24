@@ -27,6 +27,7 @@ out/
 tmp/
 bin/
 lib/
+omni_tool/
 
 # Visual Studio
 .vs/
@@ -79,6 +80,8 @@ CTestTestfile.cmake
 *~
 .DS_Store
 Thumbs.db
+*.rar
+*.zip
 
 # IDE配置
 .idea/

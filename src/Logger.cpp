@@ -101,7 +101,11 @@ void AsyncLogger::initialize(const std::string& filePath,
                              LogLevel level,
                              size_t maxFileSize,
                              bool mirrorToConsole) {
-    const std::string desiredFilePath = filePath.empty() ? "fastnet.log" : filePath;
+    std::string desiredFilePath = filePath.empty() ? "log/fastnet.log" : filePath;
+    std::filesystem::path p(desiredFilePath);
+    if (!p.has_parent_path()) {
+        desiredFilePath = "log/" + desiredFilePath;
+    }
 
     std::unique_lock<std::mutex> lock(pImpl_->mutex_);
     if (pImpl_->running_.load(std::memory_order_acquire) && desiredFilePath == pImpl_->filePath_) {

@@ -78,7 +78,6 @@ void IoUringPoller::shutdown() noexcept {
     inflight_.store(0, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(cbMutex_);
     callbacks_.clear();
-    acceptStates_.clear();
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -93,22 +92,22 @@ io_uring_sqe* IoUringPoller::getSqe() noexcept {
     return sqe;
 }
 
-void IoUringPoller::registerCallback(uintptr_t userData, IoUringCompletionFn cb) {
+void IoUringPoller::registerCallback(uintptr_t userData, IoUringCompletionFn cb, std::unique_ptr<AcceptState> state) {
     // FlatHashMap gives O(1) amortised insert — no linear scan needed.
     // Lock is still needed because submit can be called from multiple threads.
     std::lock_guard<std::mutex> lock(cbMutex_);
-    callbacks_.emplace(userData, std::move(cb));
+    callbacks_.emplace(userData, CallbackEntry{std::move(cb), std::move(state)});
 }
 
-IoUringCompletionFn IoUringPoller::takeCallback(uintptr_t userData) {
+IoUringPoller::CallbackEntry IoUringPoller::takeCallback(uintptr_t userData) {
     std::lock_guard<std::mutex> lock(cbMutex_);
     auto it = callbacks_.find(userData);
     if (it == callbacks_.end()) {
         return {};
     }
-    IoUringCompletionFn cb = std::move(it->second);
+    CallbackEntry entry = std::move(it->second);
     callbacks_.erase(it);
-    return cb;
+    return entry;
 }
 
 // ── Submission ───────────────────────────────────────────────────────────────
@@ -130,9 +129,7 @@ bool IoUringPoller::submitAccept(socket_t listenFd,
     ::io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(userData));
 
     try {
-        registerCallback(userData, std::move(callback));
-        std::lock_guard<std::mutex> lock(cbMutex_);
-        acceptStates_.push_back(std::move(state));
+        registerCallback(userData, std::move(callback), std::move(state));
     } catch (...) {
         return false;
     }
@@ -245,9 +242,9 @@ int IoUringPoller::processCompletions(int timeoutMs) noexcept {
     io_uring_for_each_cqe(&ring_, head, cqe) {
         const uintptr_t     ud  = static_cast<uintptr_t>(cqe->user_data);
         const int32_t       res = cqe->res;
-        IoUringCompletionFn cb  = takeCallback(ud);
-        if (cb) {
-            try { cb(res, ud); } catch (...) {}
+        CallbackEntry       entry = takeCallback(ud);
+        if (entry.callback) {
+            try { entry.callback(res, ud); } catch (...) {}
         }
         inflight_.fetch_sub(1, std::memory_order_relaxed);
         ++processed;

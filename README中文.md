@@ -103,6 +103,7 @@ cmake --build build/linux/Release --parallel
 - `FASTNET_ENABLE_SSL`: 是否启用 OpenSSL/TLS
 - `FASTNET_WARNINGS_AS_ERRORS`: 是否把 warning 当错误
 - `FASTNET_INSTALL_CMAKE_PACKAGE`: 是否安装 CMake package 文件
+- `FASTNET_BUILD_STATIC`: 是否构建为静态库 (默认构建为动态库)
 
 ## 示例程序
 

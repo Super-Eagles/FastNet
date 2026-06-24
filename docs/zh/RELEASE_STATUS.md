@@ -44,7 +44,7 @@ CMake 当前注册的测试目标如下：
 
 ## 3. Benchmark Matrix 记录
 
-已有 Windows 本机 plain+TLS 矩阵记录。随着 2026-04-25 的深度核心重构（TTAS 自旋锁、MpscQueue false-sharing 修复、FlatHashMap 无锁化替换等 P0/P1 重构），最新的极限单点吞吐基准（环回测试/64 并发）再次得到突破：
+已有 Windows 本机 plain+TLS 矩阵记录。随着 2026-04-25 的深度核心重构（TTAS 自旋锁、MpscQueue false-sharing 修复、FlatHashMap 无锁化替换等 P0/P1 重构），以及 2026-06-21 的高可用和极致性能二次重构（包括：FlatHashMap 完整 Rule of 5 拷贝与析构安全重写、MpscQueue 节点池分配去锁真正无锁化、IoService 0% 空闲占用自适应忙等待轮询等顶尖架构优化），最新的极限单点吞吐基准（环回测试/64 并发）再次得到突破：
 
 | 测试协议 | 单机压测吞吐量极值 | 平均延迟 | 备注 |
 | --- | --- | --- | --- |

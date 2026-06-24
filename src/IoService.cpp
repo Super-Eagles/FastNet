@@ -176,10 +176,32 @@ struct IoService::Impl {
             }
         }
 #endif
+        // Adaptive busy-spin polling:
+        // When active (events/tasks present), spin with timeout=0 for zero latency.
+        // When idle, fall back to blocking poll (timeout=-1) to achieve 0% CPU usage.
+        constexpr size_t kMaxSpinIterations = 10000;
+        size_t spinCount = 0;
+
         try {
             while (running.load(std::memory_order_acquire)) {
                 drainMailbox();
-                poller->poll(kPollTimeoutMs);
+                const bool hasTasks = (availableTaskCount.load(std::memory_order_acquire) > 0);
+
+                int timeout = 0;
+                if (!hasTasks) {
+                    if (spinCount >= kMaxSpinIterations) {
+                        timeout = -1; // Block until event or wakeup occurs
+                    } else {
+                        ++spinCount;
+                    }
+                } else {
+                    spinCount = 0;
+                }
+
+                const int eventsPolled = poller->poll(timeout);
+                if (eventsPolled > 0 || hasTasks) {
+                    spinCount = 0;
+                }
             }
             drainMailbox();
         } catch (...) {}

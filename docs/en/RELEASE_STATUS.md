@@ -44,7 +44,7 @@ Validation criteria:
 
 ## 3. Benchmark Matrix Records
 
-Windows local plain+TLS matrix records have been verified. With the deep core refactoring on 2026-04-25 (TTAS spinlocks, MpscQueue false-sharing fixes, FlatHashMap lock-free replacement, etc.), the latest peak single-node throughput benchmarks (loopback, 64 concurrency) have reached new highs:
+Windows local plain+TLS matrix records have been verified. With the deep core refactoring on 2026-04-25 (TTAS spinlocks, MpscQueue false-sharing fixes, FlatHashMap lock-free replacement, etc.) and the high-availability/extreme-performance secondary refactoring on 2026-06-21 (comprising full Rule of 5 memory safety rewrite for FlatHashMap, lock-free node allocation refactoring for MpscQueue to eliminate spinlock contention, and adaptive busy-spin polling for IoService to drop idle CPU usage to 0%), the latest peak single-node throughput benchmarks (loopback, 64 concurrency) have reached new highs:
 
 | Protocol | Peak Throughput (Local Loopback) | Average Latency | Remarks |
 | --- | --- | --- | --- |

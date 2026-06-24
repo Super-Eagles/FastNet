@@ -320,7 +320,7 @@ socket.sendTo(FastNet::Address("127.0.0.1", 9001), "ping");
 
 不要把 `ConnectionManager` 当成实际 socket 池，也不要让 `TcpConnectionPool` 负责多后端策略。
 
-## 7. 超时建议
+## 7. 超时与轮询建议
 
 - `connect timeout`: 通常 `3s ~ 10s`。
 - `read timeout`: 长连接常设 `0`，由协议心跳控制。
@@ -330,14 +330,32 @@ socket.sendTo(FastNet::Address("127.0.0.1", 9001), "ping");
 
 建连 burst 场景中，WebSocket/WSS 的握手链路更长，超时应比 TCP/HTTP 更宽。
 
-## 8. 已知边界
+**自适应忙轮询 (Adaptive Busy-Spin Polling)**：
+*   为了兼顾极致的低延迟和系统资源消耗，`IoService` 采用自适应 busy-spin 轮询策略。当系统有活跃事件或排队任务时，轮询线程会使用 `timeout = 0` 的零超时自旋忙等待（自旋窗口为 10,000 次迭代），实现亚微秒级（Sub-microsecond）的任务与事件极速处理；当系统完全空闲时，Poller 线程会自动挂起并进入阻塞系统等待中，**将空闲状态下的 CPU 占用率降至 0%**，避免无效的电量和资源消耗。
+
+## 8. 静态库构建与集成
+
+FastNet 支持被构建为静态链接库以精简最终发布包的结构：
+
+1.  **构建静态库**：在 CMake 配置时开启 `FASTNET_BUILD_STATIC` 选项：
+    ```bash
+    # 配置并生成静态库构建文件
+    cmake -S . -B build -G "Visual Studio 16 2019" -A x64 -DFASTNET_BUILD_STATIC=ON
+    # 编译 Release 产物
+    cmake --build build --config Release
+    ```
+2.  **业务端继承与宏**：
+    *   **CMake 消费**：如果您通过 `find_package(FastNet REQUIRED)` 并在项目中使用 `target_link_libraries(your_app FastNet::FastNet)` 链接该静态库，CMake 会自动将 `FASTNET_STATIC_LIB` 宏公开广播给您的项目。
+    *   **手写链接**：如果您不通过 CMake 管理，直接引入 `FastNet.lib`，则必须在您的编译配置中为编译器手动定义宏定义 `-DFASTNET_STATIC_LIB`，否则 MSVC 会尝试使用 `__declspec(dllimport)` 从而发生链接符号报错。
+
+## 9. 已知边界
 
 - `HttpClient` 当前是 HTTP/1.1 keep-alive 客户端，不是 HTTP/2 多路复用客户端。
 - `HttpServer` 和 `WebSocketServer` 当前是两个独立服务对象；不建议默认假设同端口 HTTP upgrade 路由。
 - `TLS + target-qps` loopback benchmark 不纳入默认矩阵。
 - 本机 loopback benchmark 不能替代跨机真实网卡压测。
 
-## 9. 推荐阅读顺序
+## 10. 推荐阅读顺序
 
 1. [../README.md](../README.md)
 2. [COOKBOOK.md](COOKBOOK.md)

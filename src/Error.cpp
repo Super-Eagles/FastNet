@@ -52,7 +52,42 @@ Error::Error(ErrorCode code,
       systemCode_(systemCode),
       fileName_(std::move(fileName)),
       lineNumber_(lineNumber),
-      functionName_(std::move(functionName)) {}
+      functionName_(std::move(functionName)) {
+    if (code_ != ErrorCode::Success) {
+        bool isWouldBlock = false;
+#ifdef _WIN32
+        isWouldBlock = (systemCode_ == 10035 /* WSAEWOULDBLOCK */ || systemCode_ == 997 /* WSA_IO_PENDING */ || systemCode_ == 995 /* WSA_OPERATION_ABORTED */);
+#else
+        isWouldBlock = (systemCode_ == EAGAIN || systemCode_ == EWOULDBLOCK || systemCode_ == EINPROGRESS || systemCode_ == ECANCELED);
+#endif
+        if (!isWouldBlock) {
+            std::ostringstream logMsg;
+            logMsg << "Error [" << getErrorCodeName(code_) << "]";
+            if (!message_.empty()) {
+                logMsg << ": " << message_;
+            }
+            if (systemCode_ != 0) {
+                const std::string sysMsg = getSystemErrorMessage();
+                if (!sysMsg.empty()) {
+                    logMsg << " (system: " << sysMsg << " [" << systemCode_ << "])";
+                } else {
+                    logMsg << " (system code: " << systemCode_ << ")";
+                }
+            }
+            const std::string logStr = logMsg.str();
+
+            if (AsyncLogger::getInstance().isRunning()) {
+                AsyncLogger::getInstance().log(LogLevel::ERROR_LVL,
+                                               fileName_.empty() ? nullptr : fileName_.c_str(),
+                                               lineNumber_,
+                                               functionName_.empty() ? nullptr : functionName_.c_str(),
+                                               logStr);
+            } else {
+                consoleLog(LogLevel::ERROR_LVL, logStr);
+            }
+        }
+    }
+}
 
 Error Error::success() {
     return Error();
@@ -507,11 +542,7 @@ void ExceptionPolicy::handle(const Error& error) const {
         case Strategy::ThrowException:
             throw NetworkException(error);
         case Strategy::LogAndContinue:
-            if (AsyncLogger::getInstance().isRunning()) {
-                AsyncLogger::getInstance().log(LogLevel::ERROR_LVL, nullptr, 0, nullptr, error.toString());
-            } else {
-                consoleLog(LogLevel::ERROR_LVL, error.toString());
-            }
+            // Already logged at construction time, so just return
             return;
         case Strategy::ReturnErrorCode:
         default:

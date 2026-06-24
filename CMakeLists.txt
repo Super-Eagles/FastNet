@@ -2,6 +2,12 @@
 # @brief FastNet top-level build configuration
 
 cmake_minimum_required(VERSION 3.15)
+
+# Use user's local vcpkg if present
+if(EXISTS "D:/projectC++/lib/vcpkg-master/scripts/buildsystems/vcpkg.cmake" AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    set(CMAKE_TOOLCHAIN_FILE "D:/projectC++/lib/vcpkg-master/scripts/buildsystems/vcpkg.cmake" CACHE STRING "vcpkg toolchain")
+endif()
+
 project(FastNet VERSION 1.4.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
@@ -14,12 +20,13 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(FASTNET_BUILD_EXAMPLES "Build FastNet example programs" ON)
 option(FASTNET_BUILD_TESTS "Build FastNet regression tests" ON)
-option(FASTNET_ENABLE_SSL "Enable TLS support through OpenSSL" OFF)
+option(FASTNET_ENABLE_SSL "Enable TLS support through OpenSSL" ON)
 option(FASTNET_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(FASTNET_INSTALL_CMAKE_PACKAGE "Install FastNet CMake package files" ON)
 option(FASTNET_ENABLE_IOURING "Enable Linux io_uring backend (requires liburing)" OFF)
 option(FASTNET_NATIVE_ARCH "Enable -march=native CPU-specific optimizations" ON)
 option(FASTNET_ENABLE_LTO "Enable Link-Time Optimization (IPO)" ON)
+option(FASTNET_BUILD_STATIC "Build FastNet as a static library" ON)
 
 set(FASTNET_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set(FASTNET_CMAKE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
@@ -93,7 +100,12 @@ if(FASTNET_ENABLE_IOURING)
     list(APPEND FASTNET_SOURCES src/IoUringPoller.cpp)
 endif()
 
-add_library(FastNet SHARED ${FASTNET_SOURCES})
+if(FASTNET_BUILD_STATIC)
+    add_library(FastNet STATIC ${FASTNET_SOURCES})
+    target_compile_definitions(FastNet PUBLIC FASTNET_STATIC_LIB)
+else()
+    add_library(FastNet SHARED ${FASTNET_SOURCES})
+endif()
 add_library(FastNet::FastNet ALIAS FastNet)
 
 set_target_properties(FastNet PROPERTIES
@@ -130,9 +142,6 @@ set(FASTNET_MSVC_WARNINGS
     /wd4251
     /wd4275
     /wd4324
-    /wd4244
-    /wd4717
-    /wd4702
     /wd4828
 )
 if(FASTNET_WARNINGS_AS_ERRORS)
